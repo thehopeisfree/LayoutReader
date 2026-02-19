@@ -34,6 +34,7 @@ NS = {
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
     "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
 }
 
 # Element tags we recognise inside spTree / grpSp
@@ -296,6 +297,108 @@ def _get_node_xfrm(node: ET.Element) -> Optional[Xfrm]:
 
 
 # ---------------------------------------------------------------------------
+# Semantic classification (kind / subtype)
+# ---------------------------------------------------------------------------
+
+
+def _extract_text_content(sp_node: ET.Element, max_len: int = 400) -> str:
+    ts = [t.text for t in sp_node.findall(".//p:txBody//a:t", NS) if t.text]
+    s = "".join(ts).strip()
+    if max_len and len(s) > max_len:
+        return s[:max_len]
+    return s
+
+
+def _get_placeholder_info(sp_node: ET.Element) -> Tuple[bool, Optional[str]]:
+    ph = sp_node.find("p:nvSpPr/p:nvPr/p:ph", NS)
+    if ph is None:
+        return False, None
+    return True, ph.get("type")
+
+
+def _get_prst_geom(sp_node: ET.Element) -> Optional[str]:
+    prst = sp_node.find("p:spPr/a:prstGeom", NS)
+    if prst is None:
+        return None
+    return prst.get("prst")
+
+
+def _classify_element_semantics(
+    node: ET.Element,
+    node_type: str,
+    bbox_px: Optional[Tuple[float, float, float, float]],
+    slide_px: Tuple[int, int],
+) -> Dict[str, Any]:
+    """Return semantic fields to merge into out_elem. Non-invasive."""
+    W, H = slide_px
+    meta: Dict[str, Any] = {}
+
+    if node_type == "sp":
+        text = _extract_text_content(node, max_len=400)
+        is_ph, ph_type = _get_placeholder_info(node)
+        geom = _get_prst_geom(node)
+
+        if text or is_ph:
+            meta["kind"] = "text"
+            if text:
+                meta["text_content"] = text
+                meta["text_len"] = len(text)
+            meta["has_text_body"] = node.find(".//p:txBody", NS) is not None
+            if is_ph:
+                meta["is_placeholder"] = True
+            if ph_type:
+                meta["ph_type"] = ph_type
+        else:
+            meta["kind"] = "shape"
+            if geom:
+                meta["geom_prst"] = geom
+        return meta
+
+    if node_type == "pic":
+        meta["kind"] = "image"
+        if bbox_px is not None and W > 0 and H > 0:
+            x1, y1, x2, y2 = bbox_px
+            w = max(0.0, x2 - x1)
+            h = max(0.0, y2 - y1)
+            area_ratio = (w * h) / float(W * H) if W * H else 0.0
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            is_centered = (abs(cx - W / 2.0) < (W * 0.05)) and (abs(cy - H / 2.0) < (H * 0.05))
+
+            if area_ratio > 0.9 and is_centered:
+                meta["subtype"] = "background"
+            else:
+                meta["subtype"] = "inline"
+
+            meta["area_ratio"] = round(area_ratio, 4)
+        return meta
+
+    if node_type == "cxnSp":
+        meta["kind"] = "connector"
+        return meta
+
+    if node_type == "graphicFrame":
+        meta["kind"] = "container"
+        meta["is_container"] = True
+
+        if node.find(".//a:tbl", NS) is not None:
+            meta["subtype"] = "table"
+        elif node.find(".//c:chart", NS) is not None:
+            meta["subtype"] = "chart"
+        else:
+            meta["subtype"] = "unknown"
+        return meta
+
+    if node_type == "grpSp":
+        meta["kind"] = "container"
+        meta["subtype"] = "group"
+        meta["is_container"] = True
+        return meta
+
+    return meta
+
+
+# ---------------------------------------------------------------------------
 # Slide / presentation readers
 # ---------------------------------------------------------------------------
 
@@ -402,16 +505,16 @@ def compute_bboxes_for_slide(
             )
             M_here = M_parent @ M_g
 
-            out_elems.append(
-                {
-                    "id": el_id,
-                    "name": el_name,
-                    "type": "grpSp",
-                    "parent_id": parent_id,
-                    "z_index": z_counter,
-                    "transform": xfrm.__dict__,
-                }
-            )
+            grp_elem: Dict[str, Any] = {
+                "id": el_id,
+                "name": el_name,
+                "type": "grpSp",
+                "parent_id": parent_id,
+                "z_index": z_counter,
+                "transform": xfrm.__dict__,
+            }
+            grp_elem.update(_classify_element_semantics(node, "grpSp", None, (png_w, png_h)))
+            out_elems.append(grp_elem)
             z_counter += 1
 
             for gc in list(node):
@@ -447,18 +550,20 @@ def compute_bboxes_for_slide(
 
         bbox_px = [minx * sx, miny * sy, maxx * sx, maxy * sy]
 
-        out_elems.append(
-            {
-                "id": el_id,
-                "name": el_name,
-                "type": node_type,
-                "parent_id": parent_id,
-                "z_index": z_counter,
-                "transform": xfrm.__dict__,
-                "bbox_emu": [minx, miny, maxx, maxy],
-                "bbox_px": bbox_px,
-            }
-        )
+        out_elem: Dict[str, Any] = {
+            "id": el_id,
+            "name": el_name,
+            "type": node_type,
+            "parent_id": parent_id,
+            "z_index": z_counter,
+            "transform": xfrm.__dict__,
+            "bbox_emu": [minx, miny, maxx, maxy],
+            "bbox_px": bbox_px,
+        }
+        out_elem.update(_classify_element_semantics(
+            node, node_type, tuple(bbox_px), (png_w, png_h),
+        ))
+        out_elems.append(out_elem)
         z_counter += 1
 
     M0 = Affine2D.identity()
@@ -492,7 +597,7 @@ def draw_overlay(
     out_path: str,
     *,
     draw_labels: bool = True,
-    label_fields: Tuple[str, ...] = ("id", "type", "name"),
+    label_fields: Tuple[str, ...] = ("id", "kind", "subtype", "name"),
     line_width: int = 2,
     z_order: str = "asc",
     max_labels: Optional[int] = None,
