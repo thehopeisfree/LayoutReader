@@ -323,6 +323,39 @@ def _get_prst_geom(sp_node: ET.Element) -> Optional[str]:
     return prst.get("prst")
 
 
+def _get_connector_logic(node: ET.Element) -> Dict[str, Any]:
+    """Extract connector start/end shape references from cxnSp."""
+    cxn_pr = node.find("p:nvCxnSpPr/p:cNvCxnSpPr", NS)
+    logic: Dict[str, Any] = {"start_id": None, "end_id": None}
+    if cxn_pr is not None:
+        st = cxn_pr.find("a:stCxn", NS)
+        en = cxn_pr.find("a:endCxn", NS)
+        if st is not None:
+            logic["start_id"] = st.get("id")
+        if en is not None:
+            logic["end_id"] = en.get("id")
+    return logic
+
+
+def _get_graphicframe_subtype(node: ET.Element) -> str:
+    """Detect graphicFrame content type via graphicData URI, with fallback."""
+    data = node.find(".//a:graphicData", NS)
+    if data is not None:
+        uri = data.get("uri", "")
+        if "table" in uri:
+            return "table"
+        if "chart" in uri:
+            return "chart"
+        if "diagram" in uri:
+            return "smartart"
+    # fallback: probe child elements directly
+    if node.find(".//a:tbl", NS) is not None:
+        return "table"
+    if node.find(".//c:chart", NS) is not None:
+        return "chart"
+    return "unknown"
+
+
 def _classify_element_semantics(
     node: ET.Element,
     node_type: str,
@@ -375,18 +408,15 @@ def _classify_element_semantics(
 
     if node_type == "cxnSp":
         meta["kind"] = "connector"
+        endpoints = _get_connector_logic(node)
+        if endpoints["start_id"] or endpoints["end_id"]:
+            meta["linked_endpoints"] = endpoints
         return meta
 
     if node_type == "graphicFrame":
         meta["kind"] = "container"
         meta["is_container"] = True
-
-        if node.find(".//a:tbl", NS) is not None:
-            meta["subtype"] = "table"
-        elif node.find(".//c:chart", NS) is not None:
-            meta["subtype"] = "chart"
-        else:
-            meta["subtype"] = "unknown"
+        meta["subtype"] = _get_graphicframe_subtype(node)
         return meta
 
     if node_type == "grpSp":
