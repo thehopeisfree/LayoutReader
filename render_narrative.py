@@ -1,108 +1,108 @@
 """
 render_narrative.py
 ===================
-Canonical spatial relations JSON → Line-based narrative DSL
+Canonical spatial relations JSON -> Line-based narrative DSL
 
-设计原则：
-- 每条关系一行，行首带 relation_type 标记（`overlap|`, `align|` 等）
-- 元素引用格式：semantic_name(canonical_id)，无语义名时仅 (canonical_id)
-- 数值格式固定：px 统一 1 位小数，ratio 统一整数百分比，列表 [a, b, c]
-- 词汇表封闭：重叠/对齐/排列/分布/包含/相邻/分离/在上层/在下层
-- 纯函数，无状态，无判断
+Design principles:
+- One relation per line, prefixed by relation_type tag (`overlap|`, `align|`, etc.)
+- Element reference format: semantic_name(canonical_id), or just (canonical_id)
+- Number format: px values to 1 decimal, ratios as integer percentages, lists [a, b, c]
+- Closed vocabulary: overlap/aligned/sequence/distributed/contains/adjacent/on top/below
+- Pure function, no state, no decisions
 """
 
 from typing import Optional
 
 
 def _ref(canonical_id: str, id2name: Optional[dict] = None) -> str:
-    """生成元素引用字符串。有语义名则 name(id)，否则 (id)。"""
+    """Build element reference string: name(id) if semantic name exists, else (id)."""
     if id2name and canonical_id in id2name:
         return f"{id2name[canonical_id]}({canonical_id})"
     return f"({canonical_id})"
 
 
 def _fmt_px(v) -> str:
-    """格式化 px 值：统一 1 位小数。"""
+    """Format px value: 1 decimal place."""
     if isinstance(v, list):
         return "[" + ", ".join(f"{x:.1f}" for x in v) + "]"
     return f"{v:.1f}"
 
 
 def _fmt_pct(v) -> str:
-    """格式化百分比：0-1 的 float → 整数百分比字符串。"""
+    """Format percentage: 0-1 float -> integer percentage string."""
     return f"{v * 100:.0f}%"
 
 
 def _render_overlap(rel: dict, id2name: Optional[dict] = None) -> str:
     """
-    必填: subject_id, object_id, intersection_px2
-    可选: overlap_ratio_object, top_id, z_diff
+    Required: subject_id, object_id, intersection_px2
+    Optional: overlap_ratio_object, top_id, z_diff
     """
     m = rel["metrics"]
     subj = _ref(rel["subject_id"], id2name)
     obj = _ref(rel["object_id"], id2name)
     area = _fmt_px(m["intersection_px2"])
 
-    parts = [f"overlap| {subj} 与 {obj} 重叠 {area}px²"]
+    parts = [f"overlap| {subj} overlaps {obj} by {area}px2"]
 
     if "overlap_ratio_object" in m:
-        parts.append(f"（占 {obj} 面积的 {_fmt_pct(m['overlap_ratio_object'])}）")
+        parts.append(f" ({_fmt_pct(m['overlap_ratio_object'])} of {obj})")
 
     if "top_id" in m and "z_diff" in m:
         top = _ref(m["top_id"], id2name)
-        parts.append(f"，{top} 在上层（z差 {m['z_diff']}）")
+        parts.append(f", {top} on top (z-diff {m['z_diff']})")
 
-    return "".join(parts) + "。"
+    return "".join(parts) + "."
 
 
 def _render_edge_alignment(rel: dict, id2name: Optional[dict] = None) -> str:
     """
-    必填: members, metrics.edge, metrics.max_delta_px
+    Required: members, metrics.edge, metrics.max_delta_px
     """
     m = rel["metrics"]
     members = ", ".join(_ref(mid, id2name) for mid in rel["members"])
     edge = m["edge"]
 
     edge_label = {
-        "left": "左", "right": "右",
-        "top": "上", "bottom": "下",
-        "center_x": "水平中轴", "center_y": "垂直中轴",
+        "left": "left", "right": "right",
+        "top": "top", "bottom": "bottom",
+        "center_x": "center-x", "center_y": "center-y",
     }.get(edge, edge)
 
     delta = _fmt_px(m["max_delta_px"])
-    return f"align| {members} 沿{edge_label}边对齐，最大偏差 {delta}px。"
+    return f"align| {members} aligned on {edge_label} edge, max delta {delta}px."
 
 
 def _render_sequence(rel: dict, id2name: Optional[dict] = None) -> str:
     """
-    必填: members, metrics.gaps_px
-    可选: metrics.axis, metrics.edge, metrics.max_delta_px
+    Required: members, metrics.gaps_px
+    Optional: metrics.axis, metrics.edge, metrics.max_delta_px
     """
     m = rel["metrics"]
     members = ", ".join(_ref(mid, id2name) for mid in rel["members"])
     gaps = _fmt_px(m["gaps_px"])
 
     axis = m.get("axis", "y")
-    direction = "纵向" if axis in ("y", "vertical") else "横向"
+    direction = "vertical" if axis in ("y", "vertical") else "horizontal"
 
-    parts = [f"sequence| {members} {direction}排列，间距 {gaps}px"]
+    parts = [f"sequence| {members} {direction} sequence, gaps {gaps}px"]
 
     if "edge" in m and "max_delta_px" in m:
         edge_label = {
-            "left": "左", "right": "右",
-            "top": "上", "bottom": "下",
-            "center_x": "水平中轴", "center_y": "垂直中轴",
+            "left": "left", "right": "right",
+            "top": "top", "bottom": "bottom",
+            "center_x": "center-x", "center_y": "center-y",
         }.get(m["edge"], m["edge"])
         delta = _fmt_px(m["max_delta_px"])
-        parts.append(f"，{edge_label}对齐（偏差 {delta}px）")
+        parts.append(f", {edge_label}-aligned (delta {delta}px)")
 
-    return "".join(parts) + "。"
+    return "".join(parts) + "."
 
 
 def _render_distribution(rel: dict, id2name: Optional[dict] = None) -> str:
     """
-    必填: members, metrics.intervals_px
-    可选: metrics.axis, metrics.range_px
+    Required: members, metrics.intervals_px
+    Optional: metrics.axis, metrics.range_px
     """
     m = rel["metrics"]
     members = ", ".join(_ref(mid, id2name) for mid in rel["members"])
@@ -111,85 +111,85 @@ def _render_distribution(rel: dict, id2name: Optional[dict] = None) -> str:
     axis = m.get("axis", "x")
     axis_label = {"x": "x", "y": "y", "x_gap": "x", "y_gap": "y"}.get(axis, axis)
 
-    parts = [f"dist| {members} 沿{axis_label}轴等距分布，间距 {intervals}px"]
+    parts = [f"dist| {members} evenly distributed along {axis_label}-axis, intervals {intervals}px"]
 
     if "range_px" in m:
-        parts.append(f"（极差 {_fmt_px(m['range_px'])}px）")
+        parts.append(f" (range {_fmt_px(m['range_px'])}px)")
 
-    return "".join(parts) + "。"
+    return "".join(parts) + "."
 
 
 def _render_containment(rel: dict, id2name: Optional[dict] = None) -> str:
     """
-    必填: container_id, child_ids
-    可选: metrics.padding_px
+    Required: container_id, child_ids
+    Optional: metrics.padding_px
     """
     m = rel.get("metrics", {})
     container = _ref(rel["container_id"], id2name)
     children = ", ".join(_ref(cid, id2name) for cid in rel["child_ids"])
 
-    parts = [f"contain| {container} 包含 [{children}]"]
+    parts = [f"contain| {container} contains [{children}]"]
 
     if "padding_px" in m:
         p = m["padding_px"]
         if isinstance(p, dict):
             parts.append(
-                f"，内边距 上{_fmt_px(p.get('top', 0))} "
-                f"右{_fmt_px(p.get('right', 0))} "
-                f"下{_fmt_px(p.get('bottom', 0))} "
-                f"左{_fmt_px(p.get('left', 0))}px"
+                f", padding top {_fmt_px(p.get('top', 0))} "
+                f"right {_fmt_px(p.get('right', 0))} "
+                f"bottom {_fmt_px(p.get('bottom', 0))} "
+                f"left {_fmt_px(p.get('left', 0))}px"
             )
         else:
-            parts.append(f"，内边距 {_fmt_px(p)}px")
+            parts.append(f", padding {_fmt_px(p)}px")
 
-    return "".join(parts) + "。"
+    return "".join(parts) + "."
 
 
 def _render_adjacency(rel: dict, id2name: Optional[dict] = None) -> str:
     """
-    必填: subject_id, object_id, metrics.direction
-    可选: metrics.gap_px
+    Required: subject_id, object_id, metrics.direction
+    Optional: metrics.gap_px
     """
     m = rel["metrics"]
     subj = _ref(rel["subject_id"], id2name)
     obj = _ref(rel["object_id"], id2name)
 
     dir_label = {
-        "left": "左侧", "right": "右侧",
-        "above": "上方", "below": "下方",
+        "left": "to the left of", "right": "to the right of",
+        "above": "above", "below": "below",
     }.get(m["direction"], m["direction"])
 
-    parts = [f"adj| {subj} 位于 {obj} {dir_label}"]
+    parts = [f"adj| {subj} {dir_label} {obj}"]
 
     if "gap_px" in m:
-        parts.append(f"，间距 {_fmt_px(m['gap_px'])}px")
+        parts.append(f", gap {_fmt_px(m['gap_px'])}px")
 
-    return "".join(parts) + "。"
+    return "".join(parts) + "."
 
 
 def _render_group(rel: dict, id2name: Optional[dict] = None) -> str:
     """
-    必填: group_id, child_ids
-    可选: metrics.internal_alignment, metrics.internal_gap_px
+    Required: group_id, child_ids
+    Optional: metrics.internal_alignment, metrics.internal_gap_px
     """
     m = rel.get("metrics", {})
     group = _ref(rel["group_id"], id2name)
     children = ", ".join(_ref(cid, id2name) for cid in rel["child_ids"])
 
-    parts = [f"group| {group} 内部包含 [{children}]"]
+    parts = [f"group| {group} contains [{children}]"]
 
     if "internal_alignment" in m:
-        parts.append(f"，内部沿{m['internal_alignment']}对齐")
+        parts.append(f", internally aligned on {m['internal_alignment']}")
         if "internal_alignment_delta_px" in m:
-            parts.append(f"（偏差 {_fmt_px(m['internal_alignment_delta_px'])}px）")
+            parts.append(f" (delta {_fmt_px(m['internal_alignment_delta_px'])}px)")
 
     if "internal_gap_px" in m:
-        parts.append(f"，内部间距 {_fmt_px(m['internal_gap_px'])}px")
+        parts.append(f", internal gaps {_fmt_px(m['internal_gap_px'])}px")
 
-    return "".join(parts) + "。"
+    return "".join(parts) + "."
 
 
-# ── 路由表 ──────────────────────────────────────────────
+# -- Renderer dispatch table ------------------------------------------------
 
 _RENDERERS = {
     "overlap": _render_overlap,
@@ -203,27 +203,27 @@ _RENDERERS = {
 
 
 def _fmt_offset_axis(val: float, pos_label: str, neg_label: str) -> str:
-    """格式化 CoM 偏移轴：< 0.5% 显示"居中"，否则方向+数值。"""
+    """Format CoM offset axis: < 0.5% shows 'centered', else direction+value."""
     if abs(val) < 0.005:
-        return "居中"
+        return "centered"
     direction = pos_label if val >= 0 else neg_label
-    return f"{direction}{abs(val) * 100:.1f}%"
+    return f"{direction} {abs(val) * 100:.1f}%"
 
 
 def render_density(slide_metrics: dict) -> str:
-    """渲染 slide 级密度+重心指标为一行 DSL。"""
+    """Render slide-level density + CoM metrics as one DSL line."""
     rho = slide_metrics.get("occupancy_ratio", 0)
     om = slide_metrics.get("occupancy_match", 0)
     offset = slide_metrics.get("center_of_mass_offset", [0, 0])
     ox, oy = offset[0], offset[1]
 
-    x_str = _fmt_offset_axis(ox, "右", "左")
-    y_str = _fmt_offset_axis(oy, "下", "上")
+    x_str = _fmt_offset_axis(ox, "right", "left")
+    y_str = _fmt_offset_axis(oy, "down", "up")
 
     return (
-        f"density| 画布占用率 {rho * 100:.1f}%，"
-        f"占用匹配度 {om * 100:.0f}%，"
-        f"几何重心偏移 ({x_str}, {y_str})。"
+        f"density| occupancy {rho * 100:.1f}%, "
+        f"occupancy match {om * 100:.0f}%, "
+        f"CoM offset ({x_str}, {y_str})."
     )
 
 
@@ -232,20 +232,20 @@ def render_narrative(
     id2name: Optional[dict] = None,
 ) -> str:
     """
-    将 compute_spatial_relations 输出渲染为 line-based 叙述 DSL。
+    Render compute_spatial_relations output as line-based narrative DSL.
 
     Parameters
     ----------
     data : dict or list
-        compute_spatial_relations() 的输出 dict（含 slide_metrics 和 relations），
-        或直接传 relations list（向后兼容）。
+        Output dict from compute_spatial_relations() (with slide_metrics and relations),
+        or a relations list directly (backward compatible).
     id2name : dict, optional
-        canonical_id → semantic_name 的映射表。
+        canonical_id -> semantic_name mapping.
 
     Returns
     -------
     str
-        每条关系一行的叙述文本。
+        One relation per line narrative text.
     """
     if isinstance(data, list):
         relations = data
@@ -261,7 +261,6 @@ def render_narrative(
         rtype = rel["relation_type"]
         renderer = _RENDERERS.get(rtype)
         if renderer is None:
-            # 未知类型：保留原始 JSON 作为 fallback，不中断流程
             import json
             lines.append(f"unknown| {json.dumps(rel, ensure_ascii=False)}")
         else:
@@ -269,10 +268,9 @@ def render_narrative(
     return "\n".join(lines)
 
 
-# ── 测试 ────────────────────────────────────────────────
+# -- Demo -------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # 模拟 canonical relations
     test_relations = [
         {
             "relation_type": "overlap",
@@ -329,14 +327,13 @@ if __name__ == "__main__":
             "group_id": "sh_30",
             "child_ids": ["sh_31", "sh_32"],
             "metrics": {
-                "internal_alignment": "中轴线",
+                "internal_alignment": "center_x",
                 "internal_alignment_delta_px": 0,
                 "internal_gap_px": 12,
             },
         },
     ]
 
-    # 语义名映射
     test_id2name = {
         "sh_1": "title_1",
         "sh_2": "body_text_1",

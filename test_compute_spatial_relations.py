@@ -945,11 +945,11 @@ class TestNarrativeDensity:
         assert line.startswith("density|")
         assert "72.0%" in line
         assert "88%" in line
-        assert "右3.2%" in line
-        assert "下7.1%" in line
+        assert "right 3.2%" in line
+        assert "down 7.1%" in line
 
     def test_density_centered(self):
-        """Offset < 0.5% → shows 居中."""
+        """Offset < 0.5% -> shows 'centered'."""
         from render_narrative import render_density
         m = {
             "occupancy_ratio": 0.65,
@@ -957,9 +957,9 @@ class TestNarrativeDensity:
             "center_of_mass_offset": [0.003, -0.004],
         }
         line = render_density(m)
-        assert "居中" in line
-        # Both axes should be 居中 (both < 0.5%)
-        assert line.count("居中") == 2
+        assert "centered" in line
+        # Both axes should be centered (both < 0.5%)
+        assert line.count("centered") == 2
 
     def test_density_mixed(self):
         """One axis centered, one not."""
@@ -970,11 +970,11 @@ class TestNarrativeDensity:
             "center_of_mass_offset": [0.002, -0.035],
         }
         line = render_density(m)
-        assert "居中" in line  # x-axis
-        assert "上3.5%" in line  # y-axis negative → 上
+        assert "centered" in line  # x-axis
+        assert "up 3.5%" in line  # y-axis negative -> up
 
     def test_density_left_up(self):
-        """Negative offsets → 左/上."""
+        """Negative offsets -> left/up."""
         from render_narrative import render_density
         m = {
             "occupancy_ratio": 0.50,
@@ -982,8 +982,8 @@ class TestNarrativeDensity:
             "center_of_mass_offset": [-0.10, -0.20],
         }
         line = render_density(m)
-        assert "左10.0%" in line
-        assert "上20.0%" in line
+        assert "left 10.0%" in line
+        assert "up 20.0%" in line
 
 
 # ---------------------------------------------------------------------------
@@ -1083,7 +1083,7 @@ class TestEndToEnd:
             ), f"Unknown prefix: {prefix!r} in line: {line}"
         # First line should be the density line with CoM
         assert narrative.startswith("density|")
-        assert "几何重心偏移" in narrative.split("\n")[0]
+        assert "CoM offset" in narrative.split("\n")[0]
 
     def test_pipeline_table_chart(self):
         from render_narrative import render_narrative

@@ -490,12 +490,12 @@ def _detect_groups(
 
             if best_delta <= config.alignment_tolerance_px:
                 edge_labels = {
-                    "left": "左边",
-                    "right": "右边",
-                    "top": "上边",
-                    "bottom": "下边",
-                    "center_x": "水平中轴线",
-                    "center_y": "垂直中轴线",
+                    "left": "left",
+                    "right": "right",
+                    "top": "top",
+                    "bottom": "bottom",
+                    "center_x": "center_x",
+                    "center_y": "center_y",
                 }
                 metrics["internal_alignment"] = edge_labels.get(best_edge, best_edge)
                 metrics["internal_alignment_delta_px"] = round(best_delta, 1)
