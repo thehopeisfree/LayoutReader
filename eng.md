@@ -17,6 +17,113 @@
 
 ---
 
+## 0.1 端到端 Pipeline 与依赖
+
+### 整体流程
+
+```
+[PPTX 文件] ──→ [Slide 渲染为 PNG] ──→ [pptx_bbox.py] ──→ [out.json + overlay.png]
+     ↑                ↑                       ↑
+  可能需要            外部工具             zipfile + xml.etree
+  PPT→PPTX 转换      (Office/LibreOffice)  (纯 Python，无需 python-pptx)
+```
+
+### PPTX XML 读取原理
+
+PPTX 本质是 ZIP 包，内部包含 XML 文件。本工具**不依赖 `python-pptx`**，直接用标准库读取：
+
+```python
+import zipfile
+import xml.etree.ElementTree as ET
+
+with zipfile.ZipFile("input.pptx", "r") as zf:
+    # 1. 读 slide 尺寸
+    pres_xml = zf.read("ppt/presentation.xml")       # → <p:sldSz cx="12192000" cy="6858000"/>
+
+    # 2. 读 slide 元素树
+    slide_xml = zf.read("ppt/slides/slide1.xml")      # → <p:spTree> 下的所有元素
+    root = ET.fromstring(slide_xml)
+    spTree = root.find(".//p:cSld/p:spTree", NS)       # 递归遍历起点
+```
+
+ZIP 内关键文件：
+
+| 路径 | 内容 | 本工具用途 |
+|------|------|-----------|
+| `ppt/presentation.xml` | slide 尺寸 `<p:sldSz cx cy>` | 计算 EMU→PX 缩放比 `sx/sy` |
+| `ppt/slides/slideN.xml` | 元素树 `<p:spTree>` | 遍历 sp/pic/grpSp 提取 xfrm |
+| `ppt/slideLayouts/*.xml` | 布局模板 | 当前不读取（MVP 不继承母版） |
+| `ppt/slideMasters/*.xml` | 母版 | 当前不读取 |
+| `ppt/media/*` | 图片资源 | 当前不读取 |
+
+### 上游依赖（pptx_bbox.py 之前）
+
+#### 1. PPTX 文件
+- 必须是 PPTX 格式（ZIP/OpenXML），不支持旧版 PPT（OLE2 二进制）
+- 旧版 PPT 文件即使扩展名为 `.pptx`，magic bytes 仍为 `D0CF11E0`（OLE2），需先转换
+- 转换方案：
+
+| 方案 | 环境 | 命令/调用 |
+|------|------|----------|
+| PowerPoint COM | Windows + Office | 复制 Slides 到新 Presentation，SaveAs format=24 |
+| LibreOffice headless | Linux/Mac/Windows | `soffice --headless --convert-to pptx input.ppt` |
+| 云端 API | 网络 | MS Graph API / Google Slides API |
+
+> 注意：PowerPoint COM 的 `SaveAs(path, 24)` 对旧 PPT 可能不生效，需用"新建空白 Presentation → 复制 Slides → SaveAs"的方式。
+
+#### 2. Slide 渲染为 PNG（最关键的外部依赖）
+
+`pptx_bbox.py` **不做渲染**，需要外部工具提供 slide 的 PNG 图片，用于：
+- 读取 PNG 尺寸（`W_px, H_px`），计算 `sx = W_px / slide_cx_emu`
+- 作为 debug overlay 的底图
+
+| 方案 | 命令/调用 | 备注 |
+|------|----------|------|
+| PowerPoint COM (Windows) | `slide.Export(path, "PNG", 1920, 1080)` | 渲染最准确 |
+| LibreOffice headless | `soffice --headless --convert-to png input.pptx` | Linux CI 首选，保真度略低 |
+| pdf2image + LibreOffice | 先转 PDF 再用 poppler 转 PNG | 两步走，质量较好 |
+| Aspose / GroupDocs | 商业 SDK | 无需安装 Office |
+
+> **这一步是整个链路最大的瓶颈** — 没有纯 Python 方案能高保真渲染 PPTX slide。
+
+### 本体依赖（pptx_bbox.py 自身）
+
+```
+Python >= 3.10
+Pillow >= 9.0              # PNG 读取 + overlay 绘制
+# 标准库（无需额外安装）：
+#   zipfile                # 打开 PPTX（ZIP）
+#   xml.etree.ElementTree  # 解析 slide XML
+#   math, json, argparse, dataclasses
+```
+
+> `python-pptx` 仅 `make_test_pptx.py` 生成测试数据用，核心工具不依赖。
+
+### 下游消费（pptx_bbox.py 之后）
+
+输出 JSON 的消费场景：
+
+| 用途 | 消费字段 | 说明 |
+|------|---------|------|
+| 阅读顺序模型 (LayoutReader) | `bbox_px`, `z_index`, `kind` | 训练/推理输入 |
+| OCR 对齐 | `bbox_px`, `text_content` | 与 OCR 结果做 IoU 匹配 |
+| 布局分析 | `kind`, `subtype`, `area_ratio` | 区分背景/内容/装饰 |
+| 无障碍 / 纯文本导出 | `text_content`, `z_index` | 按顺序导出文本 |
+| 质量验证 | `debug_overlay.png` | 人工目视检查 bbox 对齐 |
+
+### 最小可跑命令
+
+```bash
+pip install Pillow
+
+# 假设已有 PPTX + 对应 slide PNG
+python pptx_bbox.py input.pptx 1 slide1.png \
+    --out-json out.json \
+    --overlay debug_overlay.png
+```
+
+---
+
 ## 1. 坐标系与单位
 
 - XML 坐标单位：EMU
