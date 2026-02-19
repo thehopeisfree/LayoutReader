@@ -12,6 +12,7 @@ from compute_spatial_relations import (
     _bbox_contains,
     _cluster_by_value,
     _union_area,
+    _detect_background_ids,
     _prepare_effective_elements,
     _detect_overlaps,
     _detect_edge_alignments,
@@ -185,13 +186,63 @@ class TestUnionArea:
 # Effective elements (group-as-whole, background exclusion)
 # ---------------------------------------------------------------------------
 
+class TestBackgroundDetection:
+    """Geometric heuristic: area > 85% canvas AND z == min_visible_z."""
+
+    def test_large_bottom_layer_is_bg(self):
+        elems = [
+            _make_elem("bg", 0, 0, 1920, 1080, z_index=0, kind="image"),
+            _make_elem("txt", 100, 100, 300, 200, z_index=1, kind="text"),
+        ]
+        canvas = 1920 * 1080
+        bg = _detect_background_ids(elems, canvas, SpatialConfig())
+        assert bg == {"bg"}
+
+    def test_small_bottom_not_bg(self):
+        """Element at min z but area < 85% is NOT background."""
+        elems = [
+            _make_elem("small", 0, 0, 100, 100, z_index=0),  # 10000 / 2073600 ≈ 0.5%
+            _make_elem("other", 200, 200, 500, 500, z_index=1),
+        ]
+        bg = _detect_background_ids(elems, 1920 * 1080, SpatialConfig())
+        assert bg == set()
+
+    def test_large_non_bottom_not_bg(self):
+        """Large element NOT at min z is NOT background."""
+        elems = [
+            _make_elem("front", 0, 0, 1920, 1080, z_index=5, kind="image"),
+            _make_elem("txt", 100, 100, 200, 200, z_index=0, kind="text"),
+        ]
+        canvas = 1920 * 1080
+        bg = _detect_background_ids(elems, canvas, SpatialConfig())
+        # min_z = 0 (txt), txt is small → no bg
+        assert bg == set()
+
+    def test_no_canvas_no_detection(self):
+        elems = [_make_elem("x", 0, 0, 1920, 1080, z_index=0)]
+        bg = _detect_background_ids(elems, 0.0, SpatialConfig())
+        assert bg == set()
+
+    def test_non_image_bg(self):
+        """A full-canvas rectangle at z=0 is still background."""
+        elems = [
+            _make_elem("rect", 0, 0, 960, 540, z_index=0, kind="shape"),
+            _make_elem("txt", 100, 100, 200, 200, z_index=1, kind="text"),
+        ]
+        canvas = 960 * 540
+        bg = _detect_background_ids(elems, canvas, SpatialConfig())
+        assert bg == {"rect"}
+
+
 class TestEffectiveElements:
     def test_background_excluded(self):
+        """Geometric bg detection in effective elements."""
         elems = [
-            _make_elem("bg", 0, 0, 1920, 1080, kind="image", subtype="background"),
-            _make_elem("txt", 100, 100, 300, 200, kind="text"),
+            _make_elem("bg", 0, 0, 1920, 1080, z_index=0, kind="image"),
+            _make_elem("txt", 100, 100, 300, 200, z_index=1, kind="text"),
         ]
-        eff = _prepare_effective_elements(elems)
+        canvas = 1920 * 1080
+        eff = _prepare_effective_elements(elems, canvas_area=canvas)
         assert len(eff) == 1
         assert eff[0].id == "txt"
 
@@ -267,11 +318,14 @@ class TestOccupancy:
         assert m["occupancy_match"] == 0.0
 
     def test_om_full_coverage(self):
-        """ρ=1.0 → OM = max(0, 1 - |1-0.68|/0.25) = max(0, 1-1.28) = 0."""
+        """ρ=1.0 → OM = max(0, 1 - |1-0.68|/0.25) = max(0, 1-1.28) = 0.
+        The full-canvas element must NOT be at min z (otherwise geometric bg)."""
         raw = [
-            _make_raw("a", 0, 0, 100, 100, z_index=0),
+            _make_raw("small", 0, 0, 10, 10, z_index=0),  # tiny element at min z
+            _make_raw("a", 0, 0, 100, 100, z_index=1),     # full canvas at z=1
         ]
         m = compute_slide_metrics(raw, [100, 100])
+        # Both elements contribute: union area = 10000 (full canvas)
         assert m["occupancy_ratio"] == 1.0
         assert m["occupancy_match"] == 0.0
 
@@ -285,10 +339,11 @@ class TestOccupancy:
         assert m["occupancy_ratio"] == 0.25
 
     def test_background_excluded(self):
-        """Adding background image doesn't change ρ."""
+        """Full-canvas bottom-layer image detected as bg, doesn't affect ρ."""
         raw_no_bg = [_make_raw("a", 0, 0, 100, 100, z_index=1)]
         raw_bg = [
-            _make_raw("bg", 0, 0, 200, 200, z_index=0, kind="image", subtype="background"),
+            # Full-canvas (200x200) at z=0 → geometric bg
+            _make_raw("bg", 0, 0, 200, 200, z_index=0, kind="image"),
             _make_raw("a", 0, 0, 100, 100, z_index=1),
         ]
         m1 = compute_slide_metrics(raw_no_bg, [200, 200])
@@ -342,10 +397,11 @@ class TestCenterOfMass:
         assert m["center_of_mass_offset"] == [0.0, 0.0]
 
     def test_background_excluded(self):
-        """Background doesn't shift CoM."""
+        """Full-canvas bottom-layer bg doesn't shift CoM."""
         raw_no_bg = [_make_raw("a", 60, 60, 100, 100, z_index=1)]
         raw_bg = [
-            _make_raw("bg", 0, 0, 100, 100, z_index=0, kind="image", subtype="background"),
+            # Full-canvas (100x100) at z=0 → geometric bg
+            _make_raw("bg", 0, 0, 100, 100, z_index=0, kind="image"),
             _make_raw("a", 60, 60, 100, 100, z_index=1),
         ]
         m1 = compute_slide_metrics(raw_no_bg, [100, 100])
@@ -701,13 +757,15 @@ class TestPrepare:
         assert layout_e[0].id == "1"
 
     def test_background_excluded_from_non_bg(self):
+        """Geometric heuristic: area > 85% canvas AND min z → background."""
         raw = [
             {"id": "1", "type": "pic", "kind": "image", "subtype": "background",
              "bbox_px": [0, 0, 1920, 1080], "z_index": 0},
             {"id": "2", "type": "sp", "kind": "text",
              "bbox_px": [10, 10, 200, 200], "z_index": 1},
         ]
-        _, _, non_bg = _prepare_elements(raw, SpatialConfig())
+        canvas = 1920 * 1080
+        _, _, non_bg = _prepare_elements(raw, SpatialConfig(), canvas_area=canvas)
         assert len(non_bg) == 1
         assert non_bg[0].id == "2"
 

@@ -37,6 +37,7 @@ class SpatialConfig:
     skip_background_overlap: bool = True
     skip_connectors_from_pairwise: bool = True
     min_element_area_px2: float = 4.0
+    bg_area_ratio: float = 0.85
     om_target_ratio: float = 0.68
     om_tolerance: float = 0.25
 
@@ -166,19 +167,42 @@ def _deduplicate_ids(raw_elements: list[dict]) -> Dict[int, str]:
     return idx_to_new_id
 
 
+def _detect_background_ids(
+    elems: list[_Elem], canvas_area: float, config: SpatialConfig,
+) -> set[str]:
+    """Identify background elements by geometric heuristic.
+
+    An element is background if BOTH conditions hold:
+      1. area > bg_area_ratio × canvas_area  (covers >85% of canvas)
+      2. z_index == min visible z_index       (bottom-most layer)
+
+    This replaces the old ``subtype == "background"`` check, which depended
+    on upstream classification.  The geometric rule is robust to any element
+    type (image, rectangle, etc.) and any z_index value.
+    """
+    if not elems or canvas_area <= 0:
+        return set()
+    real = [e for e in elems if e.area > 0]
+    if not real:
+        return set()
+    min_z = min(e.z_index for e in real)
+    threshold = config.bg_area_ratio * canvas_area
+    return {e.id for e in real if e.z_index == min_z and e.area > threshold}
+
+
 def _prepare_elements(
-    raw_elements: list[dict], config: SpatialConfig
+    raw_elements: list[dict], config: SpatialConfig,
+    canvas_area: float = 0.0,
 ) -> Tuple[list[_Elem], list[_Elem], list[_Elem]]:
     """Filter and normalise raw elements into _Elem objects.
 
     Returns (all_elems, layout_elems, non_bg_elems).
-    - all_elems: every element with a usable bbox
+    - all_elems: every element with a usable bbox (+ structural grpSp)
     - layout_elems: excludes connectors
-    - non_bg_elems: excludes background images
+    - non_bg_elems: excludes background (geometric heuristic: area > 85% canvas AND min z)
 
-    Handles duplicate IDs: when the upstream pptx_bbox emits non-unique
-    element ids (e.g. multiple elements with id="0"), this function
-    rewrites them to ``{id}_z{z_index}`` and fixes parent_id references.
+    Background detection requires ``canvas_area`` > 0.  When 0 (default),
+    no background filtering is applied and non_bg_elems == all real-bbox elems.
     """
     dedup = _deduplicate_ids(raw_elements)
 
@@ -250,25 +274,35 @@ def _prepare_elements(
         # Only elements with real bboxes participate in geometric detection
         if has_bbox:
             is_connector = kind == "connector"
-            is_bg = kind == "image" and subtype == "background"
 
             if not is_connector:
                 layout_elems.append(elem)
-            if not is_bg:
-                non_bg_elems.append(elem)
+
+    # Background: geometric heuristic (area > ratio × canvas AND z == min)
+    bg_ids = _detect_background_ids(all_elems, canvas_area, config)
+    non_bg_elems = [e for e in all_elems if e.area > 0 and e.id not in bg_ids]
 
     return all_elems, layout_elems, non_bg_elems
 
 
-def _prepare_effective_elements(all_elems: list[_Elem]) -> list[_Elem]:
+def _prepare_effective_elements(
+    all_elems: list[_Elem],
+    canvas_area: float = 0.0,
+    config: SpatialConfig | None = None,
+) -> list[_Elem]:
     """Prepare effective elements for slide-level metrics (OM, CoM).
 
     Rules:
-    - Exclude background images (subtype == "background")
+    - Exclude background (geometric: area > 85% canvas AND min z)
     - Exclude connectors
     - Groups treated as single element (group bbox, children excluded)
       If a group has no bbox, it is computed from children.
     """
+    if config is None:
+        config = SpatialConfig()
+
+    bg_ids = _detect_background_ids(all_elems, canvas_area, config)
+
     group_ids = {
         e.id for e in all_elems
         if e.kind == "container" and e.subtype == "group"
@@ -277,8 +311,8 @@ def _prepare_effective_elements(all_elems: list[_Elem]) -> list[_Elem]:
 
     effective: list[_Elem] = []
     for e in all_elems:
-        # Skip background
-        if e.kind == "image" and e.subtype == "background":
+        # Skip background (geometric heuristic)
+        if e.id in bg_ids:
             continue
         # Skip connectors
         if e.kind == "connector":
@@ -932,7 +966,8 @@ def compute_spatial_relations(
     if config is None:
         config = SpatialConfig()
 
-    all_elems, layout_elems, non_bg_elems = _prepare_elements(elements, config)
+    canvas_area = float(png_size[0]) * float(png_size[1]) if png_size and len(png_size) >= 2 else 0.0
+    all_elems, layout_elems, non_bg_elems = _prepare_elements(elements, config, canvas_area)
 
     # ── Run all 7 detectors ──────────────────────────────────
 
@@ -1052,21 +1087,27 @@ def compute_slide_metrics(
     if config is None:
         config = SpatialConfig()
 
-    all_elems, _, _ = _prepare_elements(elements, config)
-    effective = _prepare_effective_elements(all_elems)
-
-    # Canvas dimensions
+    # Canvas dimensions (needed for background detection)
     if png_size and len(png_size) >= 2:
         canvas_w = float(png_size[0])
         canvas_h = float(png_size[1])
     else:
+        canvas_w, canvas_h = 0.0, 0.0
+    canvas_area = canvas_w * canvas_h
+
+    all_elems, _, _ = _prepare_elements(elements, config, canvas_area)
+
+    # Fallback canvas from element extents (if png_size not given)
+    if canvas_area <= 0:
         real = [e for e in all_elems if e.area > 0]
         if real:
             canvas_w = max(e.right for e in real)
             canvas_h = max(e.bottom for e in real)
         else:
             canvas_w, canvas_h = 1.0, 1.0
-    canvas_area = canvas_w * canvas_h
+        canvas_area = canvas_w * canvas_h
+
+    effective = _prepare_effective_elements(all_elems, canvas_area, config)
 
     # ── Occupancy Match ───────────────────────────────────
     union = _union_area(effective)
