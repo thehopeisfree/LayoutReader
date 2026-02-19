@@ -37,6 +37,8 @@ class SpatialConfig:
     skip_background_overlap: bool = True
     skip_connectors_from_pairwise: bool = True
     min_element_area_px2: float = 4.0
+    om_target_ratio: float = 0.68
+    om_tolerance: float = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +260,56 @@ def _prepare_elements(
     return all_elems, layout_elems, non_bg_elems
 
 
+def _prepare_effective_elements(all_elems: list[_Elem]) -> list[_Elem]:
+    """Prepare effective elements for slide-level metrics (OM, CoM).
+
+    Rules:
+    - Exclude background images (subtype == "background")
+    - Exclude connectors
+    - Groups treated as single element (group bbox, children excluded)
+      If a group has no bbox, it is computed from children.
+    """
+    group_ids = {
+        e.id for e in all_elems
+        if e.kind == "container" and e.subtype == "group"
+    }
+    child_ids = {e.id for e in all_elems if e.parent_id in group_ids}
+
+    effective: list[_Elem] = []
+    for e in all_elems:
+        # Skip background
+        if e.kind == "image" and e.subtype == "background":
+            continue
+        # Skip connectors
+        if e.kind == "connector":
+            continue
+        # Skip children of groups (represented by the group element)
+        if e.id in child_ids:
+            continue
+
+        if e.id in group_ids:
+            if e.area > 0:
+                effective.append(e)
+            else:
+                # Structural-only group: compute bbox from children
+                kids = [c for c in all_elems if c.parent_id == e.id and c.area > 0]
+                if not kids:
+                    continue
+                effective.append(_Elem(
+                    id=e.id, name=e.name, kind=e.kind, subtype=e.subtype,
+                    parent_id=e.parent_id, z_index=e.z_index,
+                    left=min(k.left for k in kids),
+                    top=min(k.top for k in kids),
+                    right=max(k.right for k in kids),
+                    bottom=max(k.bottom for k in kids),
+                ))
+        else:
+            if e.area > 0:
+                effective.append(e)
+
+    return effective
+
+
 # ---------------------------------------------------------------------------
 # AABB utilities
 # ---------------------------------------------------------------------------
@@ -280,6 +332,42 @@ def _bbox_contains(outer: _Elem, inner: _Elem, margin: float = 0.0) -> bool:
         and outer.right + margin >= inner.right
         and outer.bottom + margin >= inner.bottom
     )
+
+
+def _union_area(elems: list[_Elem]) -> float:
+    """Compute union area of axis-aligned rectangles via coordinate compression.
+
+    Sweep x-strips, merge y-intervals per strip, sum.  O(N^2) worst case,
+    fine for typical slide element counts (<50).
+    """
+    if not elems:
+        return 0.0
+    xs = sorted({e.left for e in elems} | {e.right for e in elems})
+    total = 0.0
+    for i in range(len(xs) - 1):
+        x1, x2 = xs[i], xs[i + 1]
+        strip_w = x2 - x1
+        if strip_w <= 0:
+            continue
+        # y-intervals covering this x-strip
+        intervals: list[Tuple[float, float]] = []
+        for e in elems:
+            if e.left <= x1 and e.right >= x2:
+                intervals.append((e.top, e.bottom))
+        if not intervals:
+            continue
+        intervals.sort()
+        merged_h = 0.0
+        cur_top, cur_bot = intervals[0]
+        for top, bot in intervals[1:]:
+            if top <= cur_bot:
+                cur_bot = max(cur_bot, bot)
+            else:
+                merged_h += cur_bot - cur_top
+                cur_top, cur_bot = top, bot
+        merged_h += cur_bot - cur_top
+        total += strip_w * merged_h
+    return total
 
 
 def _cluster_by_value(
@@ -818,8 +906,9 @@ def _rel_pair_key(rel: dict) -> Tuple[str, str] | None:
 def compute_spatial_relations(
     elements: list[dict],
     config: SpatialConfig | None = None,
-) -> list[dict]:
-    """Compute all spatial relations for a list of element dicts from pptx_bbox.
+    png_size: list | tuple | None = None,
+) -> dict:
+    """Compute all spatial relations and slide-level metrics.
 
     Parameters
     ----------
@@ -827,11 +916,13 @@ def compute_spatial_relations(
         The ``elements`` array from pptx_bbox output.
     config : SpatialConfig, optional
         Thresholds. Uses defaults if None.
+    png_size : [width, height], optional
+        Canvas size in pixels for slide metrics.
 
     Returns
     -------
-    list[dict]
-        Canonical relation dicts, each with ``relation_type`` and type-specific fields.
+    dict
+        ``{"slide_metrics": {...}, "relations": [...]}``
 
     Consistency rules (applied as post-filters, detectors stay independent):
         1. containment suppresses overlap for the same pair
@@ -924,7 +1015,86 @@ def compute_spatial_relations(
     relations.extend(contain_rels)
     relations.extend(adj_rels)
 
-    return relations
+    # Slide-level metrics
+    slide_metrics = compute_slide_metrics(elements, png_size, config)
+
+    return {
+        "slide_metrics": slide_metrics,
+        "relations": relations,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Slide-level metrics
+# ---------------------------------------------------------------------------
+
+
+def compute_slide_metrics(
+    elements: list[dict],
+    png_size: list | tuple | None = None,
+    config: SpatialConfig | None = None,
+) -> dict:
+    """Compute slide-level global metrics (OM, CoM).
+
+    Parameters
+    ----------
+    elements : list[dict]
+        The ``elements`` array from pptx_bbox output.
+    png_size : [width, height], optional
+        Canvas size in pixels.  If None, inferred from element extents.
+    config : SpatialConfig, optional
+
+    Returns
+    -------
+    dict with ``occupancy_ratio``, ``occupancy_match``,
+    ``center_of_mass_offset``, ``center_of_mass_px``, ``canvas_center_px``.
+    """
+    if config is None:
+        config = SpatialConfig()
+
+    all_elems, _, _ = _prepare_elements(elements, config)
+    effective = _prepare_effective_elements(all_elems)
+
+    # Canvas dimensions
+    if png_size and len(png_size) >= 2:
+        canvas_w = float(png_size[0])
+        canvas_h = float(png_size[1])
+    else:
+        real = [e for e in all_elems if e.area > 0]
+        if real:
+            canvas_w = max(e.right for e in real)
+            canvas_h = max(e.bottom for e in real)
+        else:
+            canvas_w, canvas_h = 1.0, 1.0
+    canvas_area = canvas_w * canvas_h
+
+    # ── Occupancy Match ───────────────────────────────────
+    union = _union_area(effective)
+    rho = union / canvas_area if canvas_area > 0 else 0.0
+    rho_star = config.om_target_ratio
+    alpha = config.om_tolerance
+    om = max(0.0, 1.0 - abs(rho - rho_star) / alpha) if alpha > 0 else (1.0 if rho == rho_star else 0.0)
+
+    # ── Center of Mass (area-weighted) ────────────────────
+    total_weight = sum(e.area for e in effective)
+    canvas_cx = canvas_w / 2.0
+    canvas_cy = canvas_h / 2.0
+    if total_weight > 0:
+        com_x = sum(e.area * e.center_x for e in effective) / total_weight
+        com_y = sum(e.area * e.center_y for e in effective) / total_weight
+    else:
+        com_x, com_y = canvas_cx, canvas_cy
+
+    offset_x = (com_x - canvas_cx) / canvas_w if canvas_w > 0 else 0.0
+    offset_y = (com_y - canvas_cy) / canvas_h if canvas_h > 0 else 0.0
+
+    return {
+        "occupancy_ratio": round(rho, 4),
+        "occupancy_match": round(om, 4),
+        "center_of_mass_offset": [round(offset_x, 4), round(offset_y, 4)],
+        "center_of_mass_px": [round(com_x, 1), round(com_y, 1)],
+        "canvas_center_px": [round(canvas_cx, 1), round(canvas_cy, 1)],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -989,14 +1159,15 @@ def main(argv: list[str] | None = None) -> None:
         adjacency_max_gap_px=args.gap,
     )
 
-    relations = compute_spatial_relations(elements, config)
+    result = compute_spatial_relations(elements, config, data.get("png_size"))
 
     output = {
         "slide_index": data.get("slide_index"),
         "png_size": data.get("png_size"),
         "element_count": len(elements),
-        "relation_count": len(relations),
-        "relations": relations,
+        "relation_count": len(result["relations"]),
+        "slide_metrics": result["slide_metrics"],
+        "relations": result["relations"],
     }
 
     json_str = json.dumps(output, ensure_ascii=False, indent=2)
@@ -1004,7 +1175,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.out_json:
         with open(args.out_json, "w", encoding="utf-8") as f:
             f.write(json_str)
-        print(f"Wrote {args.out_json}  ({len(relations)} relations)", file=sys.stderr)
+        print(f"Wrote {args.out_json}  ({len(result['relations'])} relations)", file=sys.stderr)
     else:
         sys.stdout.buffer.write(json_str.encode("utf-8"))
         sys.stdout.buffer.write(b"\n")
@@ -1013,7 +1184,7 @@ def main(argv: list[str] | None = None) -> None:
         from render_narrative import render_narrative
 
         id2name = build_id2name(elements)
-        narrative = render_narrative(relations, id2name)
+        narrative = render_narrative(result, id2name)
         print("\n--- Narrative ---", file=sys.stderr)
         sys.stdout.buffer.write(narrative.encode("utf-8"))
         sys.stdout.buffer.write(b"\n")

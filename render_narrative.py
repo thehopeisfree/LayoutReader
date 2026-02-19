@@ -202,28 +202,61 @@ _RENDERERS = {
 }
 
 
+def _fmt_offset_axis(val: float, pos_label: str, neg_label: str) -> str:
+    """格式化 CoM 偏移轴：< 0.5% 显示"居中"，否则方向+数值。"""
+    if abs(val) < 0.005:
+        return "居中"
+    direction = pos_label if val >= 0 else neg_label
+    return f"{direction}{abs(val) * 100:.1f}%"
+
+
+def render_density(slide_metrics: dict) -> str:
+    """渲染 slide 级密度+重心指标为一行 DSL。"""
+    rho = slide_metrics.get("occupancy_ratio", 0)
+    om = slide_metrics.get("occupancy_match", 0)
+    offset = slide_metrics.get("center_of_mass_offset", [0, 0])
+    ox, oy = offset[0], offset[1]
+
+    x_str = _fmt_offset_axis(ox, "右", "左")
+    y_str = _fmt_offset_axis(oy, "下", "上")
+
+    return (
+        f"density| 画布占用率 {rho * 100:.1f}%，"
+        f"占用匹配度 {om * 100:.0f}%，"
+        f"几何重心偏移 ({x_str}, {y_str})。"
+    )
+
+
 def render_narrative(
-    relations: list[dict],
+    data,
     id2name: Optional[dict] = None,
 ) -> str:
     """
-    将 canonical relations[] 渲染为 line-based 叙述 DSL。
+    将 compute_spatial_relations 输出渲染为 line-based 叙述 DSL。
 
     Parameters
     ----------
-    relations : list[dict]
-        canonical 层的 spatial.relations 数组。
-        每条必须有 "relation_type" 字段。
+    data : dict or list
+        compute_spatial_relations() 的输出 dict（含 slide_metrics 和 relations），
+        或直接传 relations list（向后兼容）。
     id2name : dict, optional
         canonical_id → semantic_name 的映射表。
-        例如 {"sh_5": "bg_image", "sh_2": "title_1"}
 
     Returns
     -------
     str
         每条关系一行的叙述文本。
     """
+    if isinstance(data, list):
+        relations = data
+        slide_metrics = None
+    else:
+        relations = data.get("relations", [])
+        slide_metrics = data.get("slide_metrics")
+
     lines = []
+    if slide_metrics:
+        lines.append(render_density(slide_metrics))
     for rel in relations:
         rtype = rel["relation_type"]
         renderer = _RENDERERS.get(rtype)
@@ -323,5 +356,6 @@ if __name__ == "__main__":
         "sh_32": "text_rating",
     }
 
-    output = render_narrative(test_relations, test_id2name)
+    test_data = {"relations": test_relations}
+    output = render_narrative(test_data, test_id2name)
     print(output)

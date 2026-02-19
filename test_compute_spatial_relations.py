@@ -11,6 +11,8 @@ from compute_spatial_relations import (
     _aabb_intersection_area,
     _bbox_contains,
     _cluster_by_value,
+    _union_area,
+    _prepare_effective_elements,
     _detect_overlaps,
     _detect_edge_alignments,
     _detect_sequences,
@@ -20,6 +22,7 @@ from compute_spatial_relations import (
     _detect_groups,
     _prepare_elements,
     compute_spatial_relations,
+    compute_slide_metrics,
     build_id2name,
 )
 
@@ -53,6 +56,11 @@ def _make_raw(
         "bbox_px": [left, top, right, bottom],
     }
     return d
+
+
+def _rels(result: dict) -> list[dict]:
+    """Extract relations list from compute_spatial_relations result."""
+    return result["relations"]
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +138,255 @@ class TestCluster:
         ]
         clusters = _cluster_by_value(elems, lambda e: e.left, tolerance=5.0)
         assert len(clusters) == 0
+
+
+# ---------------------------------------------------------------------------
+# Union area
+# ---------------------------------------------------------------------------
+
+class TestUnionArea:
+    def test_no_elements(self):
+        assert _union_area([]) == 0.0
+
+    def test_single_rect(self):
+        elems = [_make_elem("a", 0, 0, 100, 50)]
+        assert _union_area(elems) == 5000.0
+
+    def test_non_overlapping(self):
+        elems = [
+            _make_elem("a", 0, 0, 100, 100),
+            _make_elem("b", 200, 0, 300, 100),
+        ]
+        assert _union_area(elems) == 20000.0
+
+    def test_full_overlap(self):
+        elems = [
+            _make_elem("a", 0, 0, 100, 100),
+            _make_elem("b", 0, 0, 100, 100),
+        ]
+        assert _union_area(elems) == 10000.0
+
+    def test_partial_overlap(self):
+        elems = [
+            _make_elem("a", 0, 0, 100, 100),    # area 10000
+            _make_elem("b", 50, 50, 150, 150),   # area 10000, overlap 2500
+        ]
+        assert _union_area(elems) == 17500.0
+
+    def test_containment(self):
+        elems = [
+            _make_elem("a", 0, 0, 200, 200),
+            _make_elem("b", 10, 10, 50, 50),
+        ]
+        assert _union_area(elems) == 40000.0  # just the outer
+
+
+# ---------------------------------------------------------------------------
+# Effective elements (group-as-whole, background exclusion)
+# ---------------------------------------------------------------------------
+
+class TestEffectiveElements:
+    def test_background_excluded(self):
+        elems = [
+            _make_elem("bg", 0, 0, 1920, 1080, kind="image", subtype="background"),
+            _make_elem("txt", 100, 100, 300, 200, kind="text"),
+        ]
+        eff = _prepare_effective_elements(elems)
+        assert len(eff) == 1
+        assert eff[0].id == "txt"
+
+    def test_connectors_excluded(self):
+        elems = [
+            _make_elem("box", 0, 0, 100, 100, kind="text"),
+            _make_elem("cxn", 0, 0, 500, 5, kind="connector"),
+        ]
+        eff = _prepare_effective_elements(elems)
+        assert len(eff) == 1
+        assert eff[0].id == "box"
+
+    def test_group_as_whole(self):
+        """Group replaces its children in effective set."""
+        elems = [
+            _make_elem("g1", 10, 10, 200, 100, kind="container", subtype="group"),
+            _make_elem("c1", 10, 10, 100, 100, parent_id="g1"),
+            _make_elem("c2", 110, 10, 200, 100, parent_id="g1"),
+        ]
+        eff = _prepare_effective_elements(elems)
+        ids = {e.id for e in eff}
+        assert ids == {"g1"}
+        # Group's own bbox is used
+        assert eff[0].area == 190 * 90
+
+    def test_structural_group_bbox_from_children(self):
+        """Group without bbox (structural-only, area=0) gets bbox computed from children."""
+        grp = _make_elem("g1", 0, 0, 0, 0, kind="container", subtype="group")
+        c1 = _make_elem("c1", 10, 20, 100, 80, parent_id="g1")
+        c2 = _make_elem("c2", 50, 10, 200, 90, parent_id="g1")
+        eff = _prepare_effective_elements([grp, c1, c2])
+        assert len(eff) == 1
+        g = eff[0]
+        assert g.id == "g1"
+        assert g.left == 10
+        assert g.top == 10
+        assert g.right == 200
+        assert g.bottom == 90
+
+    def test_empty_group_excluded(self):
+        """Group with no children and no bbox is excluded."""
+        grp = _make_elem("g1", 0, 0, 0, 0, kind="container", subtype="group")
+        eff = _prepare_effective_elements([grp])
+        assert len(eff) == 0
+
+
+# ---------------------------------------------------------------------------
+# Occupancy Match (OM)
+# ---------------------------------------------------------------------------
+
+class TestOccupancy:
+    def test_basic(self):
+        raw = [
+            _make_raw("a", 0, 0, 100, 100, z_index=0),
+        ]
+        m = compute_slide_metrics(raw, [200, 200])
+        assert m["occupancy_ratio"] == 0.25  # 10000 / 40000
+
+    def test_om_perfect(self):
+        """ρ == ρ* → OM = 1.0."""
+        raw = [
+            _make_raw("a", 0, 0, 68, 100, z_index=0),
+        ]
+        # area=6800, canvas=100*100=10000, ρ=0.68 == default target
+        m = compute_slide_metrics(raw, [100, 100])
+        assert m["occupancy_ratio"] == 0.68
+        assert m["occupancy_match"] == 1.0
+
+    def test_om_empty(self):
+        """Empty slide → ρ=0, OM = max(0, 1 - 0.68/0.25) = 0."""
+        m = compute_slide_metrics([], [100, 100])
+        assert m["occupancy_ratio"] == 0.0
+        assert m["occupancy_match"] == 0.0
+
+    def test_om_full_coverage(self):
+        """ρ=1.0 → OM = max(0, 1 - |1-0.68|/0.25) = max(0, 1-1.28) = 0."""
+        raw = [
+            _make_raw("a", 0, 0, 100, 100, z_index=0),
+        ]
+        m = compute_slide_metrics(raw, [100, 100])
+        assert m["occupancy_ratio"] == 1.0
+        assert m["occupancy_match"] == 0.0
+
+    def test_connectors_excluded(self):
+        raw = [
+            _make_raw("a", 0, 0, 100, 100, z_index=0, kind="text"),
+            _make_raw("b", 0, 0, 500, 5, z_index=1, kind="connector", type_="cxnSp"),
+        ]
+        m = compute_slide_metrics(raw, [200, 200])
+        # Only the text box counts, not the connector
+        assert m["occupancy_ratio"] == 0.25
+
+    def test_background_excluded(self):
+        """Adding background image doesn't change ρ."""
+        raw_no_bg = [_make_raw("a", 0, 0, 100, 100, z_index=1)]
+        raw_bg = [
+            _make_raw("bg", 0, 0, 200, 200, z_index=0, kind="image", subtype="background"),
+            _make_raw("a", 0, 0, 100, 100, z_index=1),
+        ]
+        m1 = compute_slide_metrics(raw_no_bg, [200, 200])
+        m2 = compute_slide_metrics(raw_bg, [200, 200])
+        assert m1["occupancy_ratio"] == m2["occupancy_ratio"]
+
+    def test_group_as_whole(self):
+        """Group bbox used for OM, not individual children."""
+        raw_group = [
+            {"id": "g1", "type": "grpSp", "kind": "container", "subtype": "group",
+             "parent_id": None, "z_index": 0},
+            _make_raw("c1", 0, 0, 50, 100, z_index=1, parent_id="g1"),
+            _make_raw("c2", 50, 0, 100, 100, z_index=2, parent_id="g1"),
+        ]
+        m = compute_slide_metrics(raw_group, [200, 200])
+        # Group bbox computed from children: (0,0)-(100,100) = 10000
+        # canvas = 40000, ρ = 0.25
+        assert m["occupancy_ratio"] == 0.25
+
+
+# ---------------------------------------------------------------------------
+# Center of Mass (CoM)
+# ---------------------------------------------------------------------------
+
+class TestCenterOfMass:
+    def test_single_centered(self):
+        """Single element at canvas center → offset = (0, 0)."""
+        raw = [_make_raw("a", 25, 25, 75, 75, z_index=0)]
+        m = compute_slide_metrics(raw, [100, 100])
+        assert m["center_of_mass_px"] == [50.0, 50.0]
+        assert m["center_of_mass_offset"] == [0.0, 0.0]
+        assert m["canvas_center_px"] == [50.0, 50.0]
+
+    def test_single_bottom_right(self):
+        """Single element in bottom-right → positive offsets."""
+        raw = [_make_raw("a", 60, 70, 100, 100, z_index=0)]
+        m = compute_slide_metrics(raw, [100, 100])
+        # center = (80, 85), canvas center = (50, 50)
+        assert m["center_of_mass_px"] == [80.0, 85.0]
+        assert m["center_of_mass_offset"][0] == 0.3   # (80-50)/100
+        assert m["center_of_mass_offset"][1] == 0.35   # (85-50)/100
+
+    def test_symmetric_pair(self):
+        """Two equal elements placed symmetrically → offset = (0, 0)."""
+        raw = [
+            _make_raw("a", 0, 0, 50, 50, z_index=0),    # center (25, 25)
+            _make_raw("b", 50, 50, 100, 100, z_index=1),  # center (75, 75)
+        ]
+        m = compute_slide_metrics(raw, [100, 100])
+        assert m["center_of_mass_px"] == [50.0, 50.0]
+        assert m["center_of_mass_offset"] == [0.0, 0.0]
+
+    def test_background_excluded(self):
+        """Background doesn't shift CoM."""
+        raw_no_bg = [_make_raw("a", 60, 60, 100, 100, z_index=1)]
+        raw_bg = [
+            _make_raw("bg", 0, 0, 100, 100, z_index=0, kind="image", subtype="background"),
+            _make_raw("a", 60, 60, 100, 100, z_index=1),
+        ]
+        m1 = compute_slide_metrics(raw_no_bg, [100, 100])
+        m2 = compute_slide_metrics(raw_bg, [100, 100])
+        assert m1["center_of_mass_offset"] == m2["center_of_mass_offset"]
+
+    def test_group_as_whole(self):
+        """Group bbox participates as single element, not individual children.
+
+        Group bbox [0,0,100,100] vs children [0,0,50,100]+[50,0,100,100]:
+        the center is the same (50,50) here, but the area weight is ONE
+        group rectangle rather than two child rectangles.
+        """
+        # With group: single 100x100 element, center (50,50)
+        raw_group = [
+            {"id": "g1", "type": "grpSp", "kind": "container", "subtype": "group",
+             "parent_id": None, "z_index": 0},
+            _make_raw("c1", 0, 0, 50, 100, z_index=1, parent_id="g1"),
+            _make_raw("c2", 50, 0, 100, 100, z_index=2, parent_id="g1"),
+        ]
+        m = compute_slide_metrics(raw_group, [200, 200])
+        # Group bbox (0,0)-(100,100), center (50,50)
+        assert m["center_of_mass_px"] == [50.0, 50.0]
+
+    def test_empty_slide(self):
+        """Empty slide → CoM defaults to canvas center."""
+        m = compute_slide_metrics([], [100, 200])
+        assert m["center_of_mass_px"] == [50.0, 100.0]
+        assert m["center_of_mass_offset"] == [0.0, 0.0]
+
+    def test_unequal_weights(self):
+        """Larger element pulls CoM toward its center."""
+        raw = [
+            _make_raw("big", 0, 0, 100, 100, z_index=0),    # area 10000, center (50, 50)
+            _make_raw("small", 180, 0, 200, 20, z_index=1),  # area 400, center (190, 10)
+        ]
+        m = compute_slide_metrics(raw, [200, 100])
+        # weighted: x = (10000*50 + 400*190) / 10400 = 576000/10400 ≈ 55.38
+        # weighted: y = (10000*50 + 400*10) / 10400 = 504000/10400 ≈ 48.46
+        assert m["center_of_mass_px"][0] == pytest.approx(55.4, abs=0.1)
+        assert m["center_of_mass_px"][1] == pytest.approx(48.5, abs=0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -406,8 +663,8 @@ class TestGroup:
              "parent_id": "0", "z_index": 4,
              "bbox_px": [200, 10, 250, 50]},
         ]
-        rels = compute_spatial_relations(raw)
-        group_rels = [r for r in rels if r["relation_type"] == "group"]
+        result = compute_spatial_relations(raw)
+        group_rels = [r for r in _rels(result) if r["relation_type"] == "group"]
         # Should produce 2 distinct groups, not one giant group
         assert len(group_rels) == 2
         # Each group should have the correct children count
@@ -509,7 +766,7 @@ class TestContainmentSuppressesOverlap:
             _make_raw("big", 0, 0, 200, 200, z_index=0),
             _make_raw("small", 10, 10, 50, 50, z_index=1),
         ]
-        rels = compute_spatial_relations(raw)
+        rels = _rels(compute_spatial_relations(raw))
         types_for_pair = [
             r["relation_type"] for r in rels
             if {r.get("subject_id"), r.get("object_id")} == {"big", "small"}
@@ -524,7 +781,7 @@ class TestContainmentSuppressesOverlap:
             _make_raw("a", 0, 0, 100, 100, z_index=0),
             _make_raw("b", 50, 50, 150, 150, z_index=1),
         ]
-        rels = compute_spatial_relations(raw)
+        rels = _rels(compute_spatial_relations(raw))
         overlap_rels = [
             r for r in rels if r["relation_type"] == "overlap"
             and {r["subject_id"], r["object_id"]} == {"a", "b"}
@@ -542,7 +799,7 @@ class TestGroupSuppressesSlidePairwise:
             _make_raw("c1", 10, 10, 50, 50, z_index=1, parent_id="g1"),
             _make_raw("c2", 60, 10, 100, 50, z_index=2, parent_id="g1"),
         ]
-        rels = compute_spatial_relations(raw)
+        rels = _rels(compute_spatial_relations(raw))
         # group relation should exist
         group_rels = [r for r in rels if r["relation_type"] == "group"]
         assert len(group_rels) >= 1
@@ -560,7 +817,7 @@ class TestGroupSuppressesSlidePairwise:
             _make_raw("c1", 10, 10, 80, 80, z_index=1, parent_id="g1"),
             _make_raw("c2", 50, 50, 120, 120, z_index=2, parent_id="g1"),
         ]
-        rels = compute_spatial_relations(raw)
+        rels = _rels(compute_spatial_relations(raw))
         overlap_rels = [
             r for r in rels if r["relation_type"] == "overlap"
             and {r["subject_id"], r["object_id"]} == {"c1", "c2"}
@@ -578,7 +835,7 @@ class TestSequenceSuppressesAdjacency:
             _make_raw("b", 60, 100, 110, 150, z_index=1),
             _make_raw("c", 120, 100, 170, 150, z_index=2),
         ]
-        rels = compute_spatial_relations(raw)
+        rels = _rels(compute_spatial_relations(raw))
         seq_rels = [r for r in rels if r["relation_type"] == "sequence"]
         assert len(seq_rels) >= 1
         # Adjacency between consecutive sequence members suppressed
@@ -588,6 +845,87 @@ class TestSequenceSuppressesAdjacency:
         }
         assert frozenset({"a", "b"}) not in adj_pairs
         assert frozenset({"b", "c"}) not in adj_pairs
+
+
+# ---------------------------------------------------------------------------
+# compute_spatial_relations returns dict
+# ---------------------------------------------------------------------------
+
+class TestReturnFormat:
+    def test_returns_dict(self):
+        raw = [_make_raw("a", 0, 0, 100, 100, z_index=0)]
+        result = compute_spatial_relations(raw, png_size=[200, 200])
+        assert isinstance(result, dict)
+        assert "slide_metrics" in result
+        assert "relations" in result
+        assert isinstance(result["relations"], list)
+        assert isinstance(result["slide_metrics"], dict)
+
+    def test_slide_metrics_fields(self):
+        raw = [_make_raw("a", 0, 0, 100, 100, z_index=0)]
+        m = compute_spatial_relations(raw, png_size=[200, 200])["slide_metrics"]
+        assert "occupancy_ratio" in m
+        assert "occupancy_match" in m
+        assert "center_of_mass_offset" in m
+        assert "center_of_mass_px" in m
+        assert "canvas_center_px" in m
+
+
+# ---------------------------------------------------------------------------
+# Narrative rendering
+# ---------------------------------------------------------------------------
+
+class TestNarrativeDensity:
+    def test_density_with_com(self):
+        from render_narrative import render_density
+        m = {
+            "occupancy_ratio": 0.72,
+            "occupancy_match": 0.88,
+            "center_of_mass_offset": [0.032, 0.071],
+        }
+        line = render_density(m)
+        assert line.startswith("density|")
+        assert "72.0%" in line
+        assert "88%" in line
+        assert "右3.2%" in line
+        assert "下7.1%" in line
+
+    def test_density_centered(self):
+        """Offset < 0.5% → shows 居中."""
+        from render_narrative import render_density
+        m = {
+            "occupancy_ratio": 0.65,
+            "occupancy_match": 0.95,
+            "center_of_mass_offset": [0.003, -0.004],
+        }
+        line = render_density(m)
+        assert "居中" in line
+        # Both axes should be 居中 (both < 0.5%)
+        assert line.count("居中") == 2
+
+    def test_density_mixed(self):
+        """One axis centered, one not."""
+        from render_narrative import render_density
+        m = {
+            "occupancy_ratio": 0.65,
+            "occupancy_match": 0.95,
+            "center_of_mass_offset": [0.002, -0.035],
+        }
+        line = render_density(m)
+        assert "居中" in line  # x-axis
+        assert "上3.5%" in line  # y-axis negative → 上
+
+    def test_density_left_up(self):
+        """Negative offsets → 左/上."""
+        from render_narrative import render_density
+        m = {
+            "occupancy_ratio": 0.50,
+            "occupancy_match": 0.28,
+            "center_of_mass_offset": [-0.10, -0.20],
+        }
+        line = render_density(m)
+        assert "左10.0%" in line
+        assert "上20.0%" in line
 
 
 # ---------------------------------------------------------------------------
@@ -610,7 +948,8 @@ class TestIntegrationConnector:
 
     def test_relations_produced(self):
         data = _load_test_json("connector_out.json")
-        rels = compute_spatial_relations(data["elements"])
+        result = compute_spatial_relations(data["elements"], png_size=data.get("png_size"))
+        rels = result["relations"]
         assert len(rels) > 0
         types = {r["relation_type"] for r in rels}
         # Should find alignment (top-aligned boxes), sequence, adjacency
@@ -619,7 +958,7 @@ class TestIntegrationConnector:
 
     def test_connectors_not_in_overlap(self):
         data = _load_test_json("connector_out.json")
-        rels = compute_spatial_relations(data["elements"])
+        rels = _rels(compute_spatial_relations(data["elements"]))
         overlap_rels = [r for r in rels if r["relation_type"] == "overlap"]
         # Connectors should be excluded from overlap detection
         for r in overlap_rels:
@@ -628,9 +967,9 @@ class TestIntegrationConnector:
     def test_narrative_integration(self):
         from render_narrative import render_narrative
         data = _load_test_json("connector_out.json")
-        rels = compute_spatial_relations(data["elements"])
+        result = compute_spatial_relations(data["elements"], png_size=data.get("png_size"))
         id2name = build_id2name(data["elements"])
-        narrative = render_narrative(rels, id2name)
+        narrative = render_narrative(result, id2name)
         assert isinstance(narrative, str)
         assert len(narrative) > 0
 
@@ -640,14 +979,14 @@ class TestIntegrationTableChart:
 
     def test_relations_produced(self):
         data = _load_test_json("table_chart_real_out.json")
-        rels = compute_spatial_relations(data["elements"])
+        rels = _rels(compute_spatial_relations(data["elements"]))
         assert len(rels) > 0
         types = {r["relation_type"] for r in rels}
         assert "edge_alignment" in types
 
     def test_adjacency_found(self):
         data = _load_test_json("table_chart_real_out.json")
-        rels = compute_spatial_relations(data["elements"])
+        rels = _rels(compute_spatial_relations(data["elements"]))
         adj_rels = [r for r in rels if r["relation_type"] == "adjacency"]
         assert len(adj_rels) > 0
 
@@ -657,7 +996,7 @@ class TestIntegrationGroup:
 
     def test_group_detected(self):
         data = _load_test_json("group_out.json")
-        rels = compute_spatial_relations(data["elements"])
+        rels = _rels(compute_spatial_relations(data["elements"]))
         group_rels = [r for r in rels if r["relation_type"] == "group"]
         # The test data has groups with id=0 for all elements
         # so group detection depends on parent_id mapping
@@ -672,24 +1011,28 @@ class TestEndToEnd:
         from render_narrative import render_narrative
         data = _load_test_json("connector_out.json")
         elements = data["elements"]
-        rels = compute_spatial_relations(elements)
+        result = compute_spatial_relations(elements, png_size=data.get("png_size"))
         id2name = build_id2name(elements)
-        narrative = render_narrative(rels, id2name)
+        narrative = render_narrative(result, id2name)
         # Check each line starts with a known relation prefix
         for line in narrative.strip().split("\n"):
             if not line.strip():
                 continue
             prefix = line.split("|")[0].strip()
             assert prefix in (
-                "overlap", "align", "sequence", "dist",
+                "density", "overlap", "align", "sequence", "dist",
                 "contain", "adj", "group", "unknown"
             ), f"Unknown prefix: {prefix!r} in line: {line}"
+        # First line should be the density line with CoM
+        assert narrative.startswith("density|")
+        assert "几何重心偏移" in narrative.split("\n")[0]
 
     def test_pipeline_table_chart(self):
         from render_narrative import render_narrative
         data = _load_test_json("table_chart_real_out.json")
         elements = data["elements"]
-        rels = compute_spatial_relations(elements)
+        result = compute_spatial_relations(elements, png_size=data.get("png_size"))
         id2name = build_id2name(elements)
-        narrative = render_narrative(rels, id2name)
+        narrative = render_narrative(result, id2name)
         assert len(narrative) > 0
+        assert narrative.startswith("density|")
