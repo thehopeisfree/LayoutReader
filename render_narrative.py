@@ -380,6 +380,11 @@ def render_narrative(
         cw = canvas_center[0] * 2
         ch = canvas_center[1] * 2
 
+    # Extract adjacency coverage audit
+    adj_coverage = None
+    if not isinstance(data, list):
+        adj_coverage = data.get("adj_coverage")
+
     lines = ["dsl_version| 1"]
     if slide_metrics:
         lines.append(render_density(slide_metrics))
@@ -391,6 +396,13 @@ def render_narrative(
             lines.append(f"unknown| {json.dumps(rel, ensure_ascii=False)}")
         else:
             lines.append(renderer(rel, id2name, cw, ch))
+
+    # Adjacency coverage summary (after all relations)
+    if adj_coverage:
+        filled = adj_coverage["slots_filled"]
+        total = adj_coverage["slots_total"]
+        lines.append(f"adj_summary| slots filled {filled}/{total}.")
+
     return "\n".join(lines)
 
 

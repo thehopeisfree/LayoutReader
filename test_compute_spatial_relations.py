@@ -1091,7 +1091,7 @@ class TestEndToEnd:
             prefix = line.split("|")[0].strip()
             assert prefix in (
                 "dsl_version", "density", "overlap", "align", "sequence",
-                "dist", "contain", "adj", "group", "unknown"
+                "dist", "contain", "adj", "adj_summary", "group", "unknown"
             ), f"Unknown prefix: {prefix!r} in line: {line}"
         # First line is version header, second is density with CoM
         assert narrative.startswith("dsl_version| 1")

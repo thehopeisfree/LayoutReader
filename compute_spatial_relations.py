@@ -915,6 +915,45 @@ def _detect_adjacencies(
     return relations
 
 
+def _compute_adj_coverage(
+    adj_rels: list[dict],
+    element_ids: list[str],
+) -> dict:
+    """Compute adjacency direction-slot coverage for audit.
+
+    For each element, tracks which of the 4 direction slots (left, right,
+    above, below) are filled by at least one adjacency relation.
+    """
+    DIRS = ("left", "right", "above", "below")
+
+    slots: Dict[str, Dict[str, bool]] = {
+        eid: {d: False for d in DIRS} for eid in element_ids
+    }
+
+    for rel in adj_rels:
+        subj = rel["subject_id"]
+        obj = rel["object_id"]
+        direction = rel["metrics"]["direction"]
+
+        # subject is {direction} relative to object
+        if subj in slots:
+            slots[subj][direction] = True
+
+        # object gets the inverse direction filled
+        inv = _FLIP_DIR[direction]
+        if obj in slots:
+            slots[obj][inv] = True
+
+    total = len(element_ids) * 4
+    filled = sum(1 for eid in element_ids for d in DIRS if slots[eid][d])
+
+    return {
+        "slots_total": total,
+        "slots_filled": filled,
+        "per_element": slots,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pair-key helpers for suppression
 # ---------------------------------------------------------------------------
@@ -1052,12 +1091,16 @@ def compute_spatial_relations(
     relations.extend(contain_rels)
     relations.extend(adj_rels)
 
+    # Adjacency coverage audit
+    adj_coverage = _compute_adj_coverage(adj_rels, [e.id for e in adj_set])
+
     # Slide-level metrics
     slide_metrics = compute_slide_metrics(elements, png_size, config)
 
     return {
         "slide_metrics": slide_metrics,
         "relations": relations,
+        "adj_coverage": adj_coverage,
     }
 
 
@@ -1215,6 +1258,7 @@ def main(argv: list[str] | None = None) -> None:
         "element_count": len(elements),
         "relation_count": len(result["relations"]),
         "slide_metrics": result["slide_metrics"],
+        "adj_coverage": result.get("adj_coverage"),
         "relations": result["relations"],
     }
 
