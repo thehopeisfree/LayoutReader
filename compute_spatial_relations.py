@@ -494,8 +494,8 @@ def _detect_groups(
                     "right": "right",
                     "top": "top",
                     "bottom": "bottom",
-                    "center_x": "center_x",
-                    "center_y": "center_y",
+                    "center_x": "x-center",
+                    "center_y": "y-center",
                 }
                 metrics["internal_alignment"] = edge_labels.get(best_edge, best_edge)
                 metrics["internal_alignment_delta_px"] = round(best_delta, 1)

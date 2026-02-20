@@ -15,10 +15,11 @@ from typing import Optional
 
 
 def _ref(canonical_id: str, id2name: Optional[dict] = None) -> str:
-    """Build element reference string: name(id) if semantic name exists, else (id)."""
+    """Build element reference string: name(sh_id) if semantic name exists, else (sh_id)."""
+    display_id = f"sh_{canonical_id}" if canonical_id.isdigit() else canonical_id
     if id2name and canonical_id in id2name:
-        return f"{id2name[canonical_id]}({canonical_id})"
-    return f"({canonical_id})"
+        return f"{id2name[canonical_id]}({display_id})"
+    return f"({display_id})"
 
 
 def _fmt_px(v) -> str:
@@ -29,8 +30,8 @@ def _fmt_px(v) -> str:
 
 
 def _fmt_pct(v) -> str:
-    """Format percentage: 0-1 float -> integer percentage string."""
-    return f"{v * 100:.0f}%"
+    """Format percentage: 0-1 float -> 1-decimal percentage string."""
+    return f"{v * 100:.1f}%"
 
 
 def _render_overlap(rel: dict, id2name: Optional[dict] = None) -> str:
@@ -66,11 +67,12 @@ def _render_edge_alignment(rel: dict, id2name: Optional[dict] = None) -> str:
     edge_label = {
         "left": "left", "right": "right",
         "top": "top", "bottom": "bottom",
-        "center_x": "center-x", "center_y": "center-y",
+        "center_x": "x-center", "center_y": "y-center",
     }.get(edge, edge)
 
     delta = _fmt_px(m["max_delta_px"])
-    return f"align| {members} aligned on {edge_label} edge, max delta {delta}px."
+    suffix = "" if edge.startswith("center_") else " edge"
+    return f"align| {members} aligned on {edge_label}{suffix}, max delta {delta}px."
 
 
 def _render_sequence(rel: dict, id2name: Optional[dict] = None) -> str:
@@ -91,10 +93,10 @@ def _render_sequence(rel: dict, id2name: Optional[dict] = None) -> str:
         edge_label = {
             "left": "left", "right": "right",
             "top": "top", "bottom": "bottom",
-            "center_x": "center-x", "center_y": "center-y",
+            "center_x": "x-center", "center_y": "y-center",
         }.get(m["edge"], m["edge"])
         delta = _fmt_px(m["max_delta_px"])
-        parts.append(f", {edge_label}-aligned (delta {delta}px)")
+        parts.append(f", aligned on {edge_label} (delta {delta}px)")
 
     return "".join(parts) + "."
 
@@ -155,7 +157,7 @@ def _render_adjacency(rel: dict, id2name: Optional[dict] = None) -> str:
     obj = _ref(rel["object_id"], id2name)
 
     dir_label = {
-        "left": "to the left of", "right": "to the right of",
+        "left": "left_of", "right": "right_of",
         "above": "above", "below": "below",
     }.get(m["direction"], m["direction"])
 
@@ -222,7 +224,7 @@ def render_density(slide_metrics: dict) -> str:
 
     return (
         f"density| occupancy {rho * 100:.1f}%, "
-        f"occupancy match {om * 100:.0f}%, "
+        f"target_match {om * 100:.0f}%, "
         f"CoM offset ({x_str}, {y_str})."
     )
 
@@ -254,7 +256,7 @@ def render_narrative(
         relations = data.get("relations", [])
         slide_metrics = data.get("slide_metrics")
 
-    lines = []
+    lines = ["dsl_version| 1"]
     if slide_metrics:
         lines.append(render_density(slide_metrics))
     for rel in relations:

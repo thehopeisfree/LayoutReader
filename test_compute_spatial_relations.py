@@ -944,7 +944,7 @@ class TestNarrativeDensity:
         line = render_density(m)
         assert line.startswith("density|")
         assert "72.0%" in line
-        assert "88%" in line
+        assert "target_match 88%" in line
         assert "right 3.2%" in line
         assert "down 7.1%" in line
 
@@ -1078,12 +1078,14 @@ class TestEndToEnd:
                 continue
             prefix = line.split("|")[0].strip()
             assert prefix in (
-                "density", "overlap", "align", "sequence", "dist",
-                "contain", "adj", "group", "unknown"
+                "dsl_version", "density", "overlap", "align", "sequence",
+                "dist", "contain", "adj", "group", "unknown"
             ), f"Unknown prefix: {prefix!r} in line: {line}"
-        # First line should be the density line with CoM
-        assert narrative.startswith("density|")
-        assert "CoM offset" in narrative.split("\n")[0]
+        # First line is version header, second is density with CoM
+        assert narrative.startswith("dsl_version| 1")
+        lines = narrative.split("\n")
+        assert lines[1].startswith("density|")
+        assert "CoM offset" in lines[1]
 
     def test_pipeline_table_chart(self):
         from render_narrative import render_narrative
@@ -1093,4 +1095,4 @@ class TestEndToEnd:
         id2name = build_id2name(elements)
         narrative = render_narrative(result, id2name)
         assert len(narrative) > 0
-        assert narrative.startswith("density|")
+        assert narrative.startswith("dsl_version| 1")
