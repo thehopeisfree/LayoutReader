@@ -356,6 +356,58 @@ def _get_graphicframe_subtype(node: ET.Element) -> str:
     return "unknown"
 
 
+def _extract_text_layout_est(sp_node: ET.Element) -> Optional[Dict[str, Any]]:
+    """Extract text layout estimation from a text-bearing shape.
+
+    Returns dict with autofit_mode and font_pt_median, or None if no txBody.
+    """
+    txBody = sp_node.find(".//p:txBody", NS)
+    if txBody is None:
+        return None
+
+    est: Dict[str, Any] = {}
+
+    # --- autofit_mode from a:bodyPr child element ---
+    bodyPr = txBody.find("a:bodyPr", NS)
+    if bodyPr is not None:
+        if bodyPr.find("a:noAutofit", NS) is not None:
+            est["autofit_mode"] = "noAutofit"
+        elif bodyPr.find("a:spAutoFit", NS) is not None:
+            est["autofit_mode"] = "spAutoFit"
+        elif bodyPr.find("a:normAutoFit", NS) is not None:
+            est["autofit_mode"] = "normAutoFit"
+        else:
+            est["autofit_mode"] = None  # inherited from theme/master
+    else:
+        est["autofit_mode"] = None
+
+    # --- font_pt_median from a:rPr@sz (hundredths of a point) ---
+    # Accept None when sz not present -- font size may live in theme/master.
+    sizes_hundredths: List[int] = []
+    for rPr in txBody.findall(".//a:r/a:rPr", NS):
+        sz = rPr.get("sz")
+        if sz is not None:
+            try:
+                sizes_hundredths.append(int(sz))
+            except ValueError:
+                pass
+
+    if sizes_hundredths:
+        sizes_hundredths.sort()
+        n = len(sizes_hundredths)
+        if n % 2 == 1:
+            median_h = sizes_hundredths[n // 2]
+        else:
+            median_h = (sizes_hundredths[n // 2 - 1] + sizes_hundredths[n // 2]) / 2.0
+        est["font_pt_median"] = round(median_h / 100.0, 1)
+        est["font_pt_count"] = n
+    else:
+        est["font_pt_median"] = None
+        est["font_pt_count"] = 0
+
+    return est
+
+
 def _classify_element_semantics(
     node: ET.Element,
     node_type: str,
@@ -381,6 +433,9 @@ def _classify_element_semantics(
                 meta["is_placeholder"] = True
             if ph_type:
                 meta["ph_type"] = ph_type
+            text_layout = _extract_text_layout_est(node)
+            if text_layout is not None:
+                meta["text_layout_est"] = text_layout
         else:
             meta["kind"] = "shape"
             if geom:
