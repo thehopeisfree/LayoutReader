@@ -940,13 +940,17 @@ class TestNarrativeDensity:
             "occupancy_ratio": 0.72,
             "occupancy_match": 0.88,
             "center_of_mass_offset": [0.032, 0.071],
+            "center_of_mass_px": [532.0, 571.0],
+            "canvas_center_px": [500.0, 500.0],
         }
         line = render_density(m)
         assert line.startswith("density|")
         assert "72.0%" in line
         assert "target_match 88%" in line
-        assert "right 3.2%" in line
-        assert "down 7.1%" in line
+        assert "x right 3.2%" in line
+        assert "(32.0px)" in line
+        assert "y down 7.1%" in line
+        assert "(71.0px)" in line
 
     def test_density_centered(self):
         """Offset < 0.5% -> shows 'centered'."""
@@ -955,11 +959,12 @@ class TestNarrativeDensity:
             "occupancy_ratio": 0.65,
             "occupancy_match": 0.95,
             "center_of_mass_offset": [0.003, -0.004],
+            "center_of_mass_px": [503.0, 496.0],
+            "canvas_center_px": [500.0, 500.0],
         }
         line = render_density(m)
-        assert "centered" in line
-        # Both axes should be centered (both < 0.5%)
-        assert line.count("centered") == 2
+        assert "x centered" in line
+        assert "y centered" in line
 
     def test_density_mixed(self):
         """One axis centered, one not."""
@@ -968,10 +973,13 @@ class TestNarrativeDensity:
             "occupancy_ratio": 0.65,
             "occupancy_match": 0.95,
             "center_of_mass_offset": [0.002, -0.035],
+            "center_of_mass_px": [501.0, 482.5],
+            "canvas_center_px": [500.0, 500.0],
         }
         line = render_density(m)
-        assert "centered" in line  # x-axis
-        assert "up 3.5%" in line  # y-axis negative -> up
+        assert "x centered" in line
+        assert "y up 3.5%" in line
+        assert "(17.5px)" in line
 
     def test_density_left_up(self):
         """Negative offsets -> left/up."""
@@ -980,10 +988,14 @@ class TestNarrativeDensity:
             "occupancy_ratio": 0.50,
             "occupancy_match": 0.28,
             "center_of_mass_offset": [-0.10, -0.20],
+            "center_of_mass_px": [400.0, 300.0],
+            "canvas_center_px": [500.0, 500.0],
         }
         line = render_density(m)
-        assert "left 10.0%" in line
-        assert "up 20.0%" in line
+        assert "x left 10.0%" in line
+        assert "(100.0px)" in line
+        assert "y up 20.0%" in line
+        assert "(200.0px)" in line
 
 
 # ---------------------------------------------------------------------------

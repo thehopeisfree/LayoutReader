@@ -525,8 +525,10 @@ def _detect_groups(
 
             if h_ok and h_gaps:
                 metrics["internal_gap_px"] = [round(g, 1) for g in h_gaps]
+                metrics["internal_gap_axis"] = "x"
             elif v_ok and v_gaps:
                 metrics["internal_gap_px"] = [round(g, 1) for g in v_gaps]
+                metrics["internal_gap_axis"] = "y"
 
         rel: Dict[str, Any] = {
             "relation_type": "group",
@@ -1174,14 +1176,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("json_path", help="Path to pptx_bbox output JSON")
     parser.add_argument(
-        "--out-json", default=None,
-        help="Output JSON path (default: stdout)",
-    )
-    parser.add_argument(
-        "--narrative", action="store_true",
-        help="Also pipe through render_narrative and print DSL",
-    )
-    parser.add_argument(
         "--tolerance", type=float, default=5.0,
         help="Alignment tolerance in px (default: 5.0)",
     )
@@ -1191,7 +1185,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    with open(args.json_path, "r", encoding="utf-8") as f:
+    import os
+    from pathlib import Path
+
+    json_path = Path(args.json_path)
+
+    with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     elements = data.get("elements", [])
@@ -1202,6 +1201,14 @@ def main(argv: list[str] | None = None) -> None:
 
     result = compute_spatial_relations(elements, config, data.get("png_size"))
 
+    # -- Derive output paths from input: *_out.json -> *_relations.json / *_narrative.txt
+    stem = json_path.stem  # e.g. "test_3_slide1"
+    out_dir = json_path.parent
+
+    relations_path = out_dir / f"{stem}_relations.json"
+    narrative_path = out_dir / f"{stem}_narrative.txt"
+
+    # -- Write relations JSON
     output = {
         "slide_index": data.get("slide_index"),
         "png_size": data.get("png_size"),
@@ -1212,23 +1219,23 @@ def main(argv: list[str] | None = None) -> None:
     }
 
     json_str = json.dumps(output, ensure_ascii=False, indent=2)
+    with open(relations_path, "w", encoding="utf-8") as f:
+        f.write(json_str)
 
-    if args.out_json:
-        with open(args.out_json, "w", encoding="utf-8") as f:
-            f.write(json_str)
-        print(f"Wrote {args.out_json}  ({len(result['relations'])} relations)", file=sys.stderr)
-    else:
-        sys.stdout.buffer.write(json_str.encode("utf-8"))
-        sys.stdout.buffer.write(b"\n")
+    # -- Write narrative TXT
+    from render_narrative import render_narrative
 
-    if args.narrative:
-        from render_narrative import render_narrative
+    id2name = build_id2name(elements)
+    narrative = render_narrative(result, id2name)
+    with open(narrative_path, "w", encoding="utf-8") as f:
+        f.write(narrative)
+        f.write("\n")
 
-        id2name = build_id2name(elements)
-        narrative = render_narrative(result, id2name)
-        print("\n--- Narrative ---", file=sys.stderr)
-        sys.stdout.buffer.write(narrative.encode("utf-8"))
-        sys.stdout.buffer.write(b"\n")
+    print(
+        f"{json_path.name} -> {relations_path.name} ({len(result['relations'])} relations) "
+        f"+ {narrative_path.name} ({len(narrative.splitlines())} lines)",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":

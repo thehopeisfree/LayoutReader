@@ -6,12 +6,15 @@ Canonical spatial relations JSON -> Line-based narrative DSL
 Design principles:
 - One relation per line, prefixed by relation_type tag (`overlap|`, `align|`, etc.)
 - Element reference format: semantic_name(canonical_id), or just (canonical_id)
-- Number format: px values to 1 decimal, ratios as integer percentages, lists [a, b, c]
+- Dual-track numbers: % primary (with %W/%H axis suffix), px backup in parentheses
 - Closed vocabulary: overlap/aligned/sequence/distributed/contains/adjacent/on top/below
 - Pure function, no state, no decisions
 """
 
 from typing import Optional
+
+
+# -- Element reference -------------------------------------------------------
 
 
 def _ref(canonical_id: str, id2name: Optional[dict] = None) -> str:
@@ -22,6 +25,9 @@ def _ref(canonical_id: str, id2name: Optional[dict] = None) -> str:
     return f"({display_id})"
 
 
+# -- Formatting helpers ------------------------------------------------------
+
+
 def _fmt_px(v) -> str:
     """Format px value: 1 decimal place."""
     if isinstance(v, list):
@@ -29,12 +35,60 @@ def _fmt_px(v) -> str:
     return f"{v:.1f}"
 
 
-def _fmt_pct(v) -> str:
-    """Format percentage: 0-1 float -> 1-decimal percentage string."""
-    return f"{v * 100:.1f}%"
+def _fmt_pct_guard(pct: float, suffix: str = "") -> str:
+    """Format percentage (0-100 scale) with <0.1% guard and optional axis suffix.
+
+    Returns '0.0%W', '<0.1%H', '12.3%', etc.
+    """
+    if pct == 0.0:
+        return f"0.0%{suffix}"
+    if 0 < pct < 0.1:
+        return f"<0.1%{suffix}"
+    return f"{pct:.1f}%{suffix}"
 
 
-def _render_overlap(rel: dict, id2name: Optional[dict] = None) -> str:
+def _to_pct(px_val: float, canvas_dim: float) -> float:
+    """Convert px value to percentage (0-100 scale)."""
+    if canvas_dim <= 0:
+        return 0.0
+    return abs(px_val) / canvas_dim * 100
+
+
+def _fmt_axis_pct(px_val: float, canvas_dim: float, suffix: str) -> str:
+    """Convert single px value to axis-relative percentage string: '2.3%W'."""
+    pct = _to_pct(px_val, canvas_dim)
+    return _fmt_pct_guard(pct, suffix)
+
+
+def _fmt_axis_pct_list(px_list: list, canvas_dim: float, suffix: str) -> str:
+    """Convert list of px values to axis-relative percentage list: '[2.3%W, 4.4%W]'."""
+    return "[" + ", ".join(_fmt_axis_pct(v, canvas_dim, suffix) for v in px_list) + "]"
+
+
+def _edge_suffix(edge: str) -> str:
+    """Map edge name to axis suffix for percentage."""
+    return "H" if edge in ("top", "bottom", "center_y") else "W"
+
+
+def _edge_dim(edge: str, cw: float, ch: float) -> float:
+    """Map edge name to the canvas dimension for percentage."""
+    return ch if edge in ("top", "bottom", "center_y") else cw
+
+
+def _dir_suffix(direction: str) -> str:
+    """Map adjacency direction to axis suffix."""
+    return "H" if direction in ("above", "below") else "W"
+
+
+def _dir_dim(direction: str, cw: float, ch: float) -> float:
+    """Map adjacency direction to the canvas dimension for percentage."""
+    return ch if direction in ("above", "below") else cw
+
+
+# -- Relation renderers ------------------------------------------------------
+
+
+def _render_overlap(rel: dict, id2name: Optional[dict], cw: float, ch: float) -> str:
     """
     Required: subject_id, object_id, intersection_px2
     Optional: overlap_ratio_object, top_id, z_diff
@@ -46,8 +100,18 @@ def _render_overlap(rel: dict, id2name: Optional[dict] = None) -> str:
 
     parts = [f"overlap| {subj} overlaps {obj} by {area}px2"]
 
+    pct_parts = []
+    canvas_area = cw * ch
+    if canvas_area > 0:
+        canvas_pct = m["intersection_px2"] / canvas_area * 100
+        pct_parts.append(f"{_fmt_pct_guard(canvas_pct)} canvas")
+
     if "overlap_ratio_object" in m:
-        parts.append(f" ({_fmt_pct(m['overlap_ratio_object'])} of {obj})")
+        obj_pct = m["overlap_ratio_object"] * 100
+        pct_parts.append(f"{_fmt_pct_guard(obj_pct)} of {obj}")
+
+    if pct_parts:
+        parts.append(f" ({', '.join(pct_parts)})")
 
     if "top_id" in m and "z_diff" in m:
         top = _ref(m["top_id"], id2name)
@@ -56,7 +120,7 @@ def _render_overlap(rel: dict, id2name: Optional[dict] = None) -> str:
     return "".join(parts) + "."
 
 
-def _render_edge_alignment(rel: dict, id2name: Optional[dict] = None) -> str:
+def _render_edge_alignment(rel: dict, id2name: Optional[dict], cw: float, ch: float) -> str:
     """
     Required: members, metrics.edge, metrics.max_delta_px
     """
@@ -72,22 +136,31 @@ def _render_edge_alignment(rel: dict, id2name: Optional[dict] = None) -> str:
 
     delta = _fmt_px(m["max_delta_px"])
     suffix = "" if edge.startswith("center_") else " edge"
-    return f"align| {members} aligned on {edge_label}{suffix}, max delta {delta}px."
+
+    dim = _edge_dim(edge, cw, ch)
+    ax = _edge_suffix(edge)
+    pct = _fmt_axis_pct(m["max_delta_px"], dim, ax)
+
+    return f"align| {members} aligned on {edge_label}{suffix}, max delta {delta}px ({pct})."
 
 
-def _render_sequence(rel: dict, id2name: Optional[dict] = None) -> str:
+def _render_sequence(rel: dict, id2name: Optional[dict], cw: float, ch: float) -> str:
     """
     Required: members, metrics.gaps_px
     Optional: metrics.axis, metrics.edge, metrics.max_delta_px
     """
     m = rel["metrics"]
     members = ", ".join(_ref(mid, id2name) for mid in rel["members"])
-    gaps = _fmt_px(m["gaps_px"])
 
     axis = m.get("axis", "y")
     direction = "vertical" if axis in ("y", "vertical") else "horizontal"
 
-    parts = [f"sequence| {members} {direction} sequence, gaps {gaps}px"]
+    gap_dim = ch if axis in ("y", "vertical") else cw
+    gap_suffix = "H" if axis in ("y", "vertical") else "W"
+    gaps_pct = _fmt_axis_pct_list(m["gaps_px"], gap_dim, gap_suffix)
+    gaps_px = _fmt_px(m["gaps_px"])
+
+    parts = [f"sequence| {members} {direction} sequence, gaps {gaps_pct} ({gaps_px}px)"]
 
     if "edge" in m and "max_delta_px" in m:
         edge_label = {
@@ -95,33 +168,41 @@ def _render_sequence(rel: dict, id2name: Optional[dict] = None) -> str:
             "top": "top", "bottom": "bottom",
             "center_x": "x-center", "center_y": "y-center",
         }.get(m["edge"], m["edge"])
-        delta = _fmt_px(m["max_delta_px"])
-        parts.append(f", aligned on {edge_label} (delta {delta}px)")
+        delta_px = _fmt_px(m["max_delta_px"])
+        e_dim = _edge_dim(m["edge"], cw, ch)
+        delta_pct = _fmt_axis_pct(m["max_delta_px"], e_dim, _edge_suffix(m["edge"]))
+        parts.append(f", aligned on {edge_label} (delta {delta_px}px, {delta_pct})")
 
     return "".join(parts) + "."
 
 
-def _render_distribution(rel: dict, id2name: Optional[dict] = None) -> str:
+def _render_distribution(rel: dict, id2name: Optional[dict], cw: float, ch: float) -> str:
     """
     Required: members, metrics.intervals_px
     Optional: metrics.axis, metrics.range_px
     """
     m = rel["metrics"]
     members = ", ".join(_ref(mid, id2name) for mid in rel["members"])
-    intervals = _fmt_px(m["intervals_px"])
 
     axis = m.get("axis", "x")
     axis_label = {"x": "x", "y": "y", "x_gap": "x", "y_gap": "y"}.get(axis, axis)
 
-    parts = [f"dist| {members} evenly distributed along {axis_label}-axis, intervals {intervals}px"]
+    dist_dim = ch if axis_label == "y" else cw
+    dist_suffix = "H" if axis_label == "y" else "W"
+
+    intervals_pct = _fmt_axis_pct_list(m["intervals_px"], dist_dim, dist_suffix)
+    intervals_px = _fmt_px(m["intervals_px"])
+
+    parts = [f"dist| {members} evenly distributed along {axis_label}-axis, intervals {intervals_pct} ({intervals_px}px)"]
 
     if "range_px" in m:
-        parts.append(f" (range {_fmt_px(m['range_px'])}px)")
+        range_pct = _fmt_axis_pct(m["range_px"], dist_dim, dist_suffix)
+        parts.append(f" (range {range_pct}, {_fmt_px(m['range_px'])}px)")
 
     return "".join(parts) + "."
 
 
-def _render_containment(rel: dict, id2name: Optional[dict] = None) -> str:
+def _render_containment(rel: dict, id2name: Optional[dict], cw: float, ch: float) -> str:
     """
     Required: container_id, child_ids
     Optional: metrics.padding_px
@@ -135,19 +216,27 @@ def _render_containment(rel: dict, id2name: Optional[dict] = None) -> str:
     if "padding_px" in m:
         p = m["padding_px"]
         if isinstance(p, dict):
+            t_pct = _fmt_axis_pct(p.get('top', 0), ch, 'H')
+            r_pct = _fmt_axis_pct(p.get('right', 0), cw, 'W')
+            b_pct = _fmt_axis_pct(p.get('bottom', 0), ch, 'H')
+            l_pct = _fmt_axis_pct(p.get('left', 0), cw, 'W')
+            t_px = _fmt_px(p.get('top', 0))
+            r_px = _fmt_px(p.get('right', 0))
+            b_px = _fmt_px(p.get('bottom', 0))
+            l_px = _fmt_px(p.get('left', 0))
             parts.append(
-                f", padding top {_fmt_px(p.get('top', 0))} "
-                f"right {_fmt_px(p.get('right', 0))} "
-                f"bottom {_fmt_px(p.get('bottom', 0))} "
-                f"left {_fmt_px(p.get('left', 0))}px"
+                f", padding top {t_pct} right {r_pct} bottom {b_pct} left {l_pct}"
+                f" (top {t_px} right {r_px} bottom {b_px} left {l_px}px)"
             )
         else:
-            parts.append(f", padding {_fmt_px(p)}px")
+            dim = min(cw, ch) if cw > 0 and ch > 0 else max(cw, ch)
+            pct = _fmt_axis_pct(p, dim, '')
+            parts.append(f", padding {pct} ({_fmt_px(p)}px)")
 
     return "".join(parts) + "."
 
 
-def _render_adjacency(rel: dict, id2name: Optional[dict] = None) -> str:
+def _render_adjacency(rel: dict, id2name: Optional[dict], cw: float, ch: float) -> str:
     """
     Required: subject_id, object_id, metrics.direction
     Optional: metrics.gap_px
@@ -164,12 +253,15 @@ def _render_adjacency(rel: dict, id2name: Optional[dict] = None) -> str:
     parts = [f"adj| {subj} {dir_label} {obj}"]
 
     if "gap_px" in m:
-        parts.append(f", gap {_fmt_px(m['gap_px'])}px")
+        dim = _dir_dim(m["direction"], cw, ch)
+        suffix = _dir_suffix(m["direction"])
+        gap_pct = _fmt_axis_pct(m["gap_px"], dim, suffix)
+        parts.append(f", gap {gap_pct} ({_fmt_px(m['gap_px'])}px)")
 
     return "".join(parts) + "."
 
 
-def _render_group(rel: dict, id2name: Optional[dict] = None) -> str:
+def _render_group(rel: dict, id2name: Optional[dict], cw: float, ch: float) -> str:
     """
     Required: group_id, child_ids
     Optional: metrics.internal_alignment, metrics.internal_gap_px
@@ -183,10 +275,22 @@ def _render_group(rel: dict, id2name: Optional[dict] = None) -> str:
     if "internal_alignment" in m:
         parts.append(f", internally aligned on {m['internal_alignment']}")
         if "internal_alignment_delta_px" in m:
-            parts.append(f" (delta {_fmt_px(m['internal_alignment_delta_px'])}px)")
+            delta_px = _fmt_px(m["internal_alignment_delta_px"])
+            align = m["internal_alignment"]
+            if align in ("top", "bottom", "y-center"):
+                dim, suffix = ch, "H"
+            else:
+                dim, suffix = cw, "W"
+            delta_pct = _fmt_axis_pct(m["internal_alignment_delta_px"], dim, suffix)
+            parts.append(f" (delta {delta_px}px, {delta_pct})")
 
     if "internal_gap_px" in m:
-        parts.append(f", internal gaps {_fmt_px(m['internal_gap_px'])}px")
+        gap_axis = m.get("internal_gap_axis", "x")
+        gap_dim = ch if gap_axis == "y" else cw
+        gap_suffix = "H" if gap_axis == "y" else "W"
+        gaps_pct = _fmt_axis_pct_list(m["internal_gap_px"], gap_dim, gap_suffix)
+        gaps_px = _fmt_px(m["internal_gap_px"])
+        parts.append(f", internal gaps {gaps_pct} ({gaps_px}px)")
 
     return "".join(parts) + "."
 
@@ -204,12 +308,17 @@ _RENDERERS = {
 }
 
 
-def _fmt_offset_axis(val: float, pos_label: str, neg_label: str) -> str:
-    """Format CoM offset axis: < 0.5% shows 'centered', else direction+value."""
-    if abs(val) < 0.005:
+# -- Density / CoM ----------------------------------------------------------
+
+
+def _fmt_com_axis(offset_ratio: float, px_offset: float, pos_label: str, neg_label: str) -> str:
+    """Format CoM offset axis: 'centered' or 'left 8.2% (157.4px)'."""
+    if abs(offset_ratio) < 0.005:
         return "centered"
-    direction = pos_label if val >= 0 else neg_label
-    return f"{direction} {abs(val) * 100:.1f}%"
+    direction = pos_label if offset_ratio >= 0 else neg_label
+    pct = abs(offset_ratio) * 100
+    px = abs(px_offset)
+    return f"{direction} {pct:.1f}% ({px:.1f}px)"
 
 
 def render_density(slide_metrics: dict) -> str:
@@ -217,16 +326,24 @@ def render_density(slide_metrics: dict) -> str:
     rho = slide_metrics.get("occupancy_ratio", 0)
     om = slide_metrics.get("occupancy_match", 0)
     offset = slide_metrics.get("center_of_mass_offset", [0, 0])
-    ox, oy = offset[0], offset[1]
+    com_px = slide_metrics.get("center_of_mass_px", [0, 0])
+    canvas_px = slide_metrics.get("canvas_center_px", [0, 0])
 
-    x_str = _fmt_offset_axis(ox, "right", "left")
-    y_str = _fmt_offset_axis(oy, "down", "up")
+    ox, oy = offset[0], offset[1]
+    px_dx = com_px[0] - canvas_px[0]
+    px_dy = com_px[1] - canvas_px[1]
+
+    x_str = _fmt_com_axis(ox, px_dx, "right", "left")
+    y_str = _fmt_com_axis(oy, px_dy, "down", "up")
 
     return (
         f"density| occupancy {rho * 100:.1f}%, "
         f"target_match {om * 100:.0f}%, "
-        f"CoM offset ({x_str}, {y_str})."
+        f"CoM offset x {x_str}, y {y_str}."
     )
+
+
+# -- Main renderer ----------------------------------------------------------
 
 
 def render_narrative(
@@ -256,6 +373,13 @@ def render_narrative(
         relations = data.get("relations", [])
         slide_metrics = data.get("slide_metrics")
 
+    # Extract canvas dimensions for % conversion
+    cw, ch = 0.0, 0.0
+    if slide_metrics:
+        canvas_center = slide_metrics.get("canvas_center_px", [0, 0])
+        cw = canvas_center[0] * 2
+        ch = canvas_center[1] * 2
+
     lines = ["dsl_version| 1"]
     if slide_metrics:
         lines.append(render_density(slide_metrics))
@@ -266,7 +390,7 @@ def render_narrative(
             import json
             lines.append(f"unknown| {json.dumps(rel, ensure_ascii=False)}")
         else:
-            lines.append(renderer(rel, id2name))
+            lines.append(renderer(rel, id2name, cw, ch))
     return "\n".join(lines)
 
 
@@ -329,9 +453,10 @@ if __name__ == "__main__":
             "group_id": "sh_30",
             "child_ids": ["sh_31", "sh_32"],
             "metrics": {
-                "internal_alignment": "center_x",
+                "internal_alignment": "x-center",
                 "internal_alignment_delta_px": 0,
-                "internal_gap_px": 12,
+                "internal_gap_px": [12],
+                "internal_gap_axis": "x",
             },
         },
     ]
@@ -355,6 +480,15 @@ if __name__ == "__main__":
         "sh_32": "text_rating",
     }
 
-    test_data = {"relations": test_relations}
+    test_data = {
+        "slide_metrics": {
+            "occupancy_ratio": 0.72,
+            "occupancy_match": 0.88,
+            "center_of_mass_offset": [0.032, 0.071],
+            "center_of_mass_px": [532.0, 571.0],
+            "canvas_center_px": [500.0, 500.0],
+        },
+        "relations": test_relations,
+    }
     output = render_narrative(test_data, test_id2name)
     print(output)
