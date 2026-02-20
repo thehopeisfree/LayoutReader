@@ -405,7 +405,120 @@ def _extract_text_layout_est(sp_node: ET.Element) -> Optional[Dict[str, Any]]:
         est["font_pt_median"] = None
         est["font_pt_count"] = 0
 
+    # --- paragraph / line-break / char counts ---
+    est["paragraph_count"] = len(txBody.findall("a:p", NS))
+    est["line_break_count"] = len(txBody.findall(".//a:br", NS))
+
+    texts = [t.text for t in txBody.findall(".//a:t", NS) if t.text]
+    est["char_count"] = len("".join(texts))
+
+    # --- body insets (EMU) ---
+    # OOXML defaults: tIns=45720, bIns=45720, lIns=91440, rIns=91440
+    if bodyPr is not None:
+        def _inset(attr: str, default: int) -> int:
+            v = bodyPr.get(attr)  # type: ignore[union-attr]
+            return int(v) if v is not None else default
+
+        est["inset_emu"] = {
+            "top": _inset("tIns", 45720),
+            "bottom": _inset("bIns", 45720),
+            "left": _inset("lIns", 91440),
+            "right": _inset("rIns", 91440),
+        }
+    else:
+        est["inset_emu"] = {"top": 45720, "bottom": 45720, "left": 91440, "right": 91440}
+
     return est
+
+
+def _estimate_overflow_high_only(
+    out_elem: Dict[str, Any],
+    sx: float,
+    sy: float,
+) -> None:
+    """Add bbox_eff_px when geometrically certain text overflows by >= 1 line.
+
+    Mutates *out_elem* in-place.  All four rules must pass (HIGH confidence)
+    for any output to be produced; otherwise nothing is added.
+
+    Sets ``overflow_checked=True`` on text_layout_est whenever the function
+    runs past initial guard clauses, so downstream can distinguish "not checked"
+    from "checked, not HIGH".
+    """
+    layout = out_elem.get("text_layout_est")
+    if layout is None:
+        return
+
+    # Rule 1 — basic info present
+    if out_elem.get("kind") != "text":
+        return
+    font_pt = layout.get("font_pt_median")
+    if font_pt is None or layout.get("font_pt_count", 0) < 1:
+        return
+
+    # Rule 2 — autofit exclusion (shrink-to-fit shapes cannot overflow)
+    if layout.get("autofit_mode") in ("spAutoFit", "normAutoFit"):
+        layout["overflow_checked"] = True
+        return
+
+    # Rule 4 — text structure sanity (cheap – check before heavy math)
+    para_count = layout.get("paragraph_count", 0)
+    br_count = layout.get("line_break_count", 0)
+    char_count = layout.get("char_count", 0)
+    if not (para_count >= 2 or br_count >= 1 or char_count >= 20):
+        layout["overflow_checked"] = True
+        return
+
+    # --- height estimation ---
+    bbox_px = out_elem.get("bbox_px")
+    if bbox_px is None or len(bbox_px) != 4:
+        return
+    x1, y1, x2, y2 = bbox_px
+
+    px_per_pt = 12700.0 * sy  # 1 pt = 12 700 EMU; sy = png_h / slide_cy
+    font_px = font_pt * px_per_pt
+    H_line_est = font_px * 1.2  # typical line-spacing factor
+
+    inset = layout.get("inset_emu", {})
+    inset_top_px = inset.get("top", 45720) * sy
+    inset_bot_px = inset.get("bottom", 45720) * sy
+    inset_left_px = inset.get("left", 91440) * sx
+    inset_right_px = inset.get("right", 91440) * sx
+
+    H_box = y2 - y1
+    H_usable = H_box - inset_top_px - inset_bot_px
+
+    usable_width_px = (x2 - x1) - inset_left_px - inset_right_px
+
+    # line-count estimation
+    explicit_lines = para_count + br_count
+    chars_per_line = math.floor(usable_width_px / (font_px * 0.6)) if font_px > 0 else 1
+    wrapped_lines = math.ceil(char_count / max(chars_per_line, 1))
+    line_count_est = max(explicit_lines, wrapped_lines)
+
+    H_req_est = line_count_est * H_line_est
+    excess = H_req_est - H_usable
+
+    layout["overflow_checked"] = True
+
+    # Rule 3 — excess must exceed one full line
+    if excess <= 1.0 * H_line_est:
+        return
+
+    # --- HIGH confidence: emit bbox_eff_px ---
+    excess = min(excess, 3.0 * H_line_est)  # cap at 3 lines
+    out_elem["bbox_eff_px"] = [x1, y1, x2, round(y2 + excess, 1)]
+
+    layout["is_overflowing_est"] = True
+    layout["overflow_confidence"] = "high"
+    layout["excess_height_px_est"] = round(excess, 1)
+    layout["overflow_evidence"] = {
+        "usable_h_px": round(H_usable, 1),
+        "required_h_px_est": round(H_req_est, 1),
+        "line_h_px_est": round(H_line_est, 1),
+        "line_count_est": line_count_est,
+        "chars_per_line_est": chars_per_line,
+    }
 
 
 def _classify_element_semantics(
@@ -648,6 +761,8 @@ def compute_bboxes_for_slide(
         out_elem.update(_classify_element_semantics(
             node, node_type, tuple(bbox_px), (png_w, png_h),
         ))
+        if out_elem.get("kind") == "text" and "text_layout_est" in out_elem:
+            _estimate_overflow_high_only(out_elem, sx, sy)
         out_elems.append(out_elem)
         z_counter += 1
 

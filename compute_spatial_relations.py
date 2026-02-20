@@ -233,8 +233,8 @@ def _prepare_elements(
         z_index = int(raw.get("z_index", 0))
         name = raw.get("name")
 
-        # Parse bbox — may be None for grpSp containers
-        bbox = raw.get("bbox_px")
+        # Parse bbox — prefer overflow-corrected bbox_eff_px, fall back to bbox_px
+        bbox = raw.get("bbox_eff_px") or raw.get("bbox_px")
         has_bbox = bbox and isinstance(bbox, list) and len(bbox) == 4
 
         if has_bbox:
