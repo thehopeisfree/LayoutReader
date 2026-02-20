@@ -281,35 +281,256 @@ For each element, tracks which of 4 direction slots (left, right, above, below) 
 
 ---
 
-## 3. Layer 3: Narrative Renderer (`render_narrative.py`)
+## 3. Layer 3: Narrative DSL (`render_narrative.py`)
 
-### 3.1 Purpose
+### 3.1 Purpose & Design Goal
 
-Transform the structured relations JSON into a line-based DSL that an LLM can consume as spatial context. Pure function — no state, no decisions.
+Transform structured spatial relations JSON into a **line-based DSL** that an LLM can consume as spatial context in its prompt. The DSL is the pipeline's final output — the contract between geometric computation and language model understanding.
 
-### 3.2 DSL Format
+Core constraint: the DSL must be **parseable by both machines and LLMs**. This rules out free-form prose (ambiguous to parse) and raw JSON (wasteful in tokens, hard for LLMs to reason about spatially).
+
+### 3.2 Why Line-Based DSL (Not JSON, Not Prose)
+
+| Format | Tokens | Parseable | LLM-friendly | Chosen |
+|--------|--------|-----------|--------------|--------|
+| Raw JSON | High (braces, quotes, keys) | Exact | Poor — nested structure, hard to scan | No |
+| Free prose | Medium | Ambiguous | Medium — natural but imprecise | No |
+| Line-based DSL | Low | Regex-friendly | Good — one fact per line, scannable | **Yes** |
+
+The line-based format achieves:
+- **Token efficiency:** ~40-60% fewer tokens than equivalent JSON
+- **Grepping:** each line is self-contained — LLM can ctrl+F for `adj|` to find all adjacency relations
+- **Incremental reading:** LLM can stop reading when it has enough context
+- **Deterministic parsing:** `tag| content` format is trivially regex-parseable for downstream tooling
+
+### 3.3 DSL Grammar
+
+#### 3.3.1 Line Structure
+
+Every line follows the pattern:
+
+```
+TAG| BODY.
+```
+
+- `TAG` — lowercase relation type identifier, immediately followed by `|`
+- `BODY` — relation content in semi-structured English, ending with `.`
+- One relation per line, no multi-line spans
+- Lines appear in canonical order: `dsl_version` → `density` → relations (by type) → `adj_summary`
+
+#### 3.3.2 Tag Vocabulary (Closed Set)
+
+| Tag | Relation | Arity | Pattern |
+|-----|----------|-------|---------|
+| `dsl_version` | Meta | — | `dsl_version\| 1` |
+| `density` | Slide-level | — | `density\| occupancy ...%, target_match ...%, CoM offset x ..., y ....` |
+| `group` | Structural | 1 → N | `group\| PARENT contains [CHILDREN], ...` |
+| `overlap` | Pairwise | 2 | `overlap\| SUBJ overlaps OBJ by ...` |
+| `align` | Set | N | `align\| MEMBERS aligned on EDGE edge, ...` |
+| `sequence` | Ordered set | N | `sequence\| MEMBERS {horizontal\|vertical} sequence, gaps ...` |
+| `dist` | Ordered set | N | `dist\| MEMBERS evenly distributed along AXIS-axis, ...` |
+| `contain` | 1 → N | N | `contain\| CONTAINER contains [CHILDREN], padding ...` |
+| `adj` | Pairwise | 2 | `adj\| SUBJ {left_of\|right_of\|above\|below} OBJ, gap ...` |
+| `adj_summary` | Audit | — | `adj_summary\| slots filled N/M.` |
+
+This vocabulary is **closed** — no new tags without a version bump. An LLM seeing `dsl_version| 1` knows exactly which tags to expect.
+
+#### 3.3.3 Element Reference Format
+
+```
+semantic_name(sh_ID)     # when name exists in PowerPoint
+(sh_ID)                  # when name is absent
+```
+
+Examples:
+- `Title 1(sh_2)` — named shape with XML id "2"
+- `(sh_15)` — unnamed shape
+- `InnerRect1(0_z9)` — shape with deduplicated ID (original id "0", z_index 9)
+
+Design rationale:
+- **Name first:** LLMs understand `Title 1` better than `sh_2`. The name provides semantic context.
+- **ID in parentheses:** always present for unambiguous cross-referencing back to JSON.
+- **`sh_` prefix:** distinguishes shape IDs from numbers in metrics. Prevents LLM confusion between "element 2" and "2 pixels".
+
+#### 3.3.4 Number Format: Dual-Track `%` + `px`
+
+Every measurement appears twice — percentage primary, pixel backup:
+
+```
+gap 2.3%W (44.2px)
+padding top 0.7%H right 0.6%W bottom 0.7%H left 0.6%W (top 8.0 right 12.0 bottom 8.0 left 12.0px)
+intervals [2.2%W, 2.3%W] ([42.0, 45.0]px)
+```
+
+**Why percentage as primary:**
+- Resolution-independent — `2.3%W` means the same thing on a 1920px slide and a 3840px slide
+- Intuitive for layout reasoning — "5% of slide width" is immediately meaningful
+- Comparable across slides of different sizes
+
+**Why pixel as backup:**
+- Exact for debugging and verification
+- Needed when comparing against absolute thresholds
+- Ground truth — percentage is derived from px
+
+**Axis suffixes (`%W` / `%H`):**
+- Horizontal measurements (left, right, center_x, gap in x-direction): `%W` (percentage of canvas width)
+- Vertical measurements (top, bottom, center_y, gap in y-direction): `%H` (percentage of canvas height)
+- This prevents ambiguity: `5%W` on a 16:9 slide is not the same physical distance as `5%H`
+
+**Guard formatting:**
+- `0.0%` — exactly zero
+- `<0.1%` — positive but below display threshold (avoids misleading `0.0%` for non-zero values)
+- `12.3%` — normal display (1 decimal place)
+
+### 3.4 Per-Tag Line Templates
+
+#### `density|` — Slide-Level Metrics
+
+```
+density| occupancy {ρ}%, target_match {OM}%, CoM offset x {x_desc}, y {y_desc}.
+```
+
+Where `{x_desc}` / `{y_desc}` is one of:
+- `centered` — offset < 0.5%
+- `right 8.2% (157.4px)` / `left ...` — horizontal shift
+- `down 3.1% (33.5px)` / `up ...` — vertical shift
+
+This line tells the LLM: "the slide is X% full, Y% close to ideal density, and the visual weight is shifted in Z direction."
+
+#### `group|` — Structural Group
+
+```
+group| PARENT contains [CHILD1, CHILD2, ...].
+group| PARENT contains [CHILD1, CHILD2], internally aligned on EDGE (delta Dpx, D%), internal gaps [G1%, G2%] ([G1, G2]px).
+```
+
+Optional metrics appear only when detected:
+- `internally aligned on {left|right|top|bottom|x-center|y-center}` — children share an edge
+- `internal gaps [...]` — spacing between children along sequence axis
+
+#### `overlap|` — Area Overlap
+
+```
+overlap| SUBJ overlaps OBJ by Apx2 (C% canvas, P% of OBJ), SUBJ on top (z-diff Z).
+```
+
+- `Apx2` — intersection area in square pixels
+- `C% canvas` — intersection as percentage of total slide area
+- `P% of OBJ` — how much of the object is covered (occlusion severity)
+- `z-diff Z` — layer distance (higher z = visually on top)
+
+#### `align|` — Edge Alignment
+
+```
+align| M1, M2, M3 aligned on {left|right|top|bottom|x-center|y-center} edge, max delta Dpx (D%).
+```
+
+- `max delta` — worst-case deviation within the alignment cluster
+- Edge types: `left edge`, `right edge`, `top edge`, `bottom edge`, `x-center` (no "edge" suffix), `y-center`
+
+#### `sequence|` — Ordered Spatial Sequence
+
+```
+sequence| M1, M2, M3 {horizontal|vertical} sequence, gaps [G1%, G2%] ([G1, G2]px).
+sequence| M1, M2, M3 vertical sequence, gaps [G1%H] ([G1]px), aligned on left (delta Dpx, D%W).
+```
+
+- Members listed in spatial order (left-to-right or top-to-bottom)
+- Optional `, aligned on EDGE (delta ...)` — when the sequence also forms an alignment
+
+#### `dist|` — Even Distribution
+
+```
+dist| M1, M2, M3 evenly distributed along {x|y}-axis, intervals [I1%, I2%] ([I1, I2]px) (range R%, Rpx).
+```
+
+- Only emitted when gap coefficient of variation (CV) ≤ 0.15 — genuinely even spacing
+- `range` — max gap minus min gap (how "even" the distribution really is)
+
+#### `contain|` — Geometric Containment
+
+```
+contain| CONTAINER contains [CHILD1, CHILD2], padding top T%H right R%W bottom B%H left L%W (top T right R bottom B left Lpx).
+```
+
+- Padding in CSS order: top, right, bottom, left
+- Each padding value uses its axis-appropriate suffix
+
+#### `adj|` — Adjacency
+
+```
+adj| SUBJ {left_of|right_of|above|below} OBJ, gap G% (Gpx).
+```
+
+- Direction describes subject relative to object: `A left_of B` means A is to the left of B
+- Canonical order: higher z_index = subject (consistent with overlap convention)
+
+#### `adj_summary|` — Coverage Audit
+
+```
+adj_summary| slots filled F/T.
+```
+
+- `T` = total direction slots (elements × 4 directions)
+- `F` = slots with at least one adjacency relation
+- Low coverage signals sparse layout or elements too far apart for adjacency detection
+
+### 3.5 Output Order
+
+Lines appear in this fixed order:
+
+```
+1. dsl_version| 1
+2. density| ...                    (slide-level metrics)
+3. group| ...                      (structural — from XML parent_id)
+4. overlap| ...                    (pairwise — higher z = subject)
+5. align| ...                      (set — per edge type)
+6. sequence| ...                   (ordered set — per axis)
+7. dist| ...                       (derived from sequences)
+8. contain| ...                    (1→N — smallest container first)
+9. adj| ...                        (pairwise — higher z = subject)
+10. adj_summary| ...               (audit)
+```
+
+This order is intentional:
+- **Structural relations first** (group) — establishes hierarchy before spatial details
+- **Overlap before adjacency** — overlapping elements are more visually salient
+- **Sequence before distribution** — distribution is a refinement of sequence
+- **Adjacency last** — most numerous, lowest information density per line
+
+### 3.6 Design Principles
+
+1. **Pure function, no state** — `render_narrative(data, id2name) → str`. No side effects, no configuration, no memory.
+
+2. **No decisions** — the renderer never filters, ranks, or omits relations. Every relation from Layer 2 produces exactly one line. Importance/relevance judgment is left to the consuming LLM.
+
+3. **Closed vocabulary** — the set of verbs is fixed: `overlaps`, `aligned on`, `sequence`, `evenly distributed`, `contains`, `left_of`/`right_of`/`above`/`below`, `on top`. An LLM can learn this vocabulary once and apply it to any slide.
+
+4. **Self-describing** — each line contains all information needed to understand the relation. No cross-line references required (element names are repeated, not "see line 5").
+
+5. **Deterministic** — same input always produces same output. No randomness, no sampling, no heuristic ordering within a type. This enables diff-based regression testing.
+
+### 3.7 Real Output Example
+
+From `test_connector.pptx` — three horizontally-spaced rectangles:
 
 ```
 dsl_version| 1
-density| occupancy 45.2%, target_match 78%, CoM offset x centered, y up 3.2% (34.6px).
-group| icon_group(sh_30) contains [icon_star(sh_31), text_rating(sh_32)], internally aligned on x-center (delta 0.0px, 0.0%W), internal gaps [1.3%W] ([12.0]px).
-overlap| pic_logo(sh_5) overlaps body_text(sh_2) by 240.0px2 (0.1% canvas, 15.0% of body_text(sh_2)), pic_logo(sh_5) on top (z-diff 3).
-align| title_1(sh_1), body_text(sh_2), footer_1(sh_3) aligned on left edge, max delta 2.4px (0.1%W).
-sequence| title_1(sh_1), body_text(sh_2), page_num(sh_4) vertical sequence, gaps [2.2%H, 4.4%H] ([24.0, 48.0]px).
-dist| pic_a(sh_10), pic_b(sh_11), pic_c(sh_12) evenly distributed along x-axis, intervals [2.2%W, 2.3%W] ([42.0, 45.0]px).
-contain| content_box(sh_20) contains [inner_title(sh_21), inner_body(sh_22)], padding top 0.7%H right 0.6%W bottom 0.7%H left 0.6%W (top 8.0 right 12.0 bottom 8.0 left 12.0px).
-adj| icon_1(sh_6) left_of label_1(sh_7), gap 0.8%W (16.0px).
-adj_summary| slots filled 12/20.
+density| occupancy 10.8%, target_match 0%, CoM offset x left 0.8% (15.1px), y up 2.6% (28.2px).
+align| Rectangle 1(sh_2), Rectangle 2(sh_3), Rectangle 3(sh_4) aligned on top edge, max delta 0.0px (0.0%H).
+align| Rectangle 1(sh_2), Rectangle 2(sh_3), Rectangle 3(sh_4) aligned on bottom edge, max delta 0.0px (0.0%H).
+align| Rectangle 1(sh_2), Rectangle 2(sh_3), Rectangle 3(sh_4) aligned on y-center, max delta 0.0px (0.0%H).
+sequence| Rectangle 1(sh_2), Rectangle 2(sh_3), Rectangle 3(sh_4) horizontal sequence, gaps [16.4%W, 16.4%W] ([315.0, 315.0]px), aligned on top (delta 0.0px, 0.0%H).
+dist| Rectangle 1(sh_2), Rectangle 2(sh_3), Rectangle 3(sh_4) evenly distributed along x-axis, intervals [16.4%W, 16.4%W] ([315.0, 315.0]px) (range 0.0%W, 0.0px).
+adj_summary| slots filled 0/12.
 ```
 
-### 3.3 Design Conventions
-
-- **One relation per line**, prefixed by type tag (`overlap|`, `align|`, `adj|`, etc.)
-- **Element references:** `semantic_name(sh_id)` when name exists, `(sh_id)` otherwise
-- **Dual-track numbers:** percentage primary (with `%W`/`%H` axis suffix) + px backup in parentheses
-- **Closed vocabulary:** overlap / aligned / sequence / distributed / contains / adjacent / on top / below / left_of / right_of / above / below
-- **Axis-relative percentages:** horizontal values use `%W`, vertical values use `%H`
-- **Guard formatting:** values <0.1% render as `<0.1%` to avoid false precision
+What an LLM can read from this:
+- Three rectangles, perfectly aligned top/bottom/center — they form a row
+- Evenly spaced horizontally at 16.4%W each — uniform grid
+- Low occupancy (10.8%) — mostly empty slide
+- CoM slightly left and up — the row is above center
+- No adjacency filled (0/12) — rectangles are spaced far apart (gaps > adjacency threshold)
 
 ---
 
